@@ -1,0 +1,1238 @@
+
+  src\brain_runtime.c:1444:            float z = gate[i];
+  src\brain_runtime.c:1445:            ffn[i] = (z / (1.0f + expf(-z))) * up[i];
+  src\brain_runtime.c:1446:        }
+  src\brain_runtime.c:1447:        snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", layer);
+  src\brain_runtime.c:1448:        TensorInfo down;
+  src\brain_runtime.c:1449:        if (!find_tensor(&g, name, &down) || down.n_dims != 2 ||
+  src\brain_runtime.c:1450:            down.dims[0] != FFN_SIZE || down.dims[1] != HIDDEN_SIZE ||
+  src\brain_runtime.c:1451:            !tensor_matvec(&g, &down, ffn, proj)) goto tensor_error;
+  src\brain_runtime.c:1452:        for (int i = 0; i < HIDDEN_SIZE; ++i) x[i] += proj[i];
+  src\brain_runtime.c:1453:        if ((layer + 1) % 4 == 0) fprintf(stderr, "Completed layer %d/%d\n", layer + 1, LAYERS);
+  src\brain_runtime.c:1454:#undef MAT
+  src\brain_runtime.c:1455:    }
+  src\brain_runtime.c:1456:
+  src\brain_runtime.c:1457:    if (!vector_named(&g, "output_norm.weight", norm, HIDDEN_SIZE)) goto tensor_error;
+  src\brain_runtime.c:1458:    rms_norm(x, norm, proj, HIDDEN_SIZE, RMS_EPS);
+  src\brain_runtime.c:1459:    TensorInfo out;
+  src\brain_runtime.c:1460:    if (!find_tensor(&g, "output.weight", &out) || out.n_dims != 2 ||
+  src\brain_runtime.c:1461:        out.dims[0] != HIDDEN_SIZE || out.dims[1] > SIZE_MAX / sizeof(float)) goto tensor_error;
+  src\brain_runtime.c:1462:    logits = malloc((size_t)out.dims[1] * sizeof(float));
+  src\brain_runtime.c:1463:    if (!logits || !tensor_matvec(&g, &out, proj, logits)) goto tensor_error;
+  src\brain_runtime.c:1464:    {
+  src\brain_runtime.c:1465:        uint64_t best[5] = {0};
+  src\brain_runtime.c:1466:        for (int j = 0; j < 5; ++j) best[j] = UINT64_MAX;
+  src\brain_runtime.c:1467:        for (uint64_t i = 0; i < out.dims[1]; ++i) {
+  src\brain_runtime.c:1468:            for (int j = 0; j < 5; ++j) {
+  src\brain_runtime.c:1469:                if (best[j] == UINT64_MAX || logits[i] > logits[best[j]]) {
+  src\brain_runtime.c:1470:                    for (int z = 4; z > j; --z) best[z] = best[z - 1];
+  src\brain_runtime.c:1471:                    best[j] = i; break;
+  src\brain_runtime.c:1472:                }
+  src\brain_runtime.c:1473:            }
+  src\brain_runtime.c:1474:        }
+  src\brain_runtime.c:1475:        printf("Top token scores for input token %llu:\n", token);
+  src\brain_runtime.c:1476:        for (int j = 0; j < 5; ++j)
+  src\brain_runtime.c:1477:            printf("%d: token_id=%llu logit=%g\n", j + 1,
+  src\brain_runtime.c:1478:                   (unsigned long long)best[j], logits[best[j]]);
+  src\brain_runtime.c:1479:    }
+  src\brain_runtime.c:1480:    ok = 1;
+  src\brain_runtime.c:1481:    goto done;
+  src\brain_runtime.c:1482:
+  src\brain_runtime.c:1483:tensor_error:
+> src\brain_runtime.c:1484:    fprintf(stderr, "Inference failed: missing, incompatible, or unreadable tensor\n");
+  src\brain_runtime.c:1485:done:
+  src\brain_runtime.c:1486:    free(x); free(norm); free(q); free(k); free(v); free(att); free(proj);
+  src\brain_runtime.c:1487:    free(gate); free(up); free(ffn); free(logits);
+  src\brain_runtime.c:1488:    gguf_close(&g);
+  src\brain_runtime.c:1489:    ram_model_free();
+  src\brain_runtime.c:1490:    return ok ? 0 : 1;
+  src\brain_runtime.c:1491:}
+  src\brain_runtime.c:1492:#endif
+  src\brain_runtime.c:1493:
+  src\brain_runtime.c:1494:#if defined(ATLAS_COMPACT)
+  src\brain_runtime.c:1495:enum { FFN_SIZE = 4864, LAYERS = 24, MAX_CONTEXT = 2048 };
+  src\brain_runtime.c:1496:#else
+  src\brain_runtime.c:1497:enum { FFN_SIZE = 8960, LAYERS = 28, MAX_CONTEXT = 2048 };
+  src\brain_runtime.c:1498:#endif
+  src\brain_runtime.c:1499:typedef struct {
+  src\brain_runtime.c:1500:    float *x, *norm, *q, *k, *v, *att, *proj, *gate, *up, *ffn, *bias;
+  src\brain_runtime.c:1501:    float *scores, *weights;
+  src\brain_runtime.c:1502:} Work;
+  src\brain_runtime.c:1503:
+  src\brain_runtime.c:1504:static int forward_token(GGUFFile *g, uint32_t token, size_t pos,
+  src\brain_runtime.c:1505:                         float *kc, float *vc, Work *w, float *logits,
+  src\brain_runtime.c:1506:                         uint64_t vocab, int want_logits)
+  src\brain_runtime.c:1507:{
+  src\brain_runtime.c:1508:    TensorInfo emb;
+  src\brain_runtime.c:1509:    if (!find_tensor(g, "token_embd.weight", &emb) || token >= emb.dims[1] ||
+  src\brain_runtime.c:1510:        !load_embedding_row(g, &emb, token, w->x)) return 0;
+  src\brain_runtime.c:1511:    for (int layer = 0; layer < LAYERS; ++layer) {
+  src\brain_runtime.c:1512:        char name[96];
+  src\brain_runtime.c:1513:        snprintf(name, sizeof(name), "blk.%d.attn_norm.weight", layer);
+  src\brain_runtime.c:1514:        if (!vector_named(g, name, w->norm, HIDDEN_SIZE)) return 0;
+  src\brain_runtime.c:1515:        rms_norm(w->x, w->norm, w->proj, HIDDEN_SIZE, RMS_EPS);
+  src\brain_runtime.c:1516:        char q_name[96],k_name[96],v_name[96];
+  src\brain_runtime.c:1517:        snprintf(q_name,sizeof(q_name),"blk.%d.attn_q.weight",layer);
+  src\brain_runtime.c:1518:        snprintf(k_name,sizeof(k_name),"blk.%d.attn_k.weight",layer);
+  src\brain_runtime.c:1519:        snprintf(v_name,sizeof(v_name),"blk.%d.attn_v.weight",layer);
+  src\brain_runtime.c:1520:        const char *qkv_names[3]={q_name,k_name,v_name};
+  src\brain_runtime.c:1521:        float *qkv_outputs[3]={w->q,w->k,w->v};
+  src\brain_runtime.c:1522:        if (!tensor_matvec_batch(g,qkv_names,qkv_outputs,3,w->proj)) return 0;
+  src\brain_runtime.c:1523:        snprintf(name, sizeof(name), "blk.%d.attn_q.bias", layer);
+  src\brain_runtime.c:1524:        if (!vector_named(g, name, w->bias, Q_DIM)) return 0;
+  src\brain_runtime.c:1525:        add_bias(w->q, w->bias, Q_DIM);
+  src\brain_runtime.c:1526:        snprintf(name, sizeof(name), "blk.%d.attn_k.bias", layer);
+  src\brain_runtime.c:1527:        if (!vector_named(g, name, w->bias, KV_DIM)) return 0;
+  src\brain_runtime.c:1528:        add_bias(w->k, w->bias, KV_DIM);
+  src\brain_runtime.c:1529:        snprintf(name, sizeof(name), "blk.%d.attn_v.bias", layer);
+  src\brain_runtime.c:1530:        if (!vector_named(g, name, w->bias, KV_DIM)) return 0;
+  src\brain_runtime.c:1531:        add_bias(w->v, w->bias, KV_DIM);
+  src\brain_runtime.c:1532:        rope(w->q, w->k, Q_DIM, KV_DIM, (int)pos);
+  src\brain_runtime.c:1533:        if (!gqa_single_token(w->q, w->k, w->v, w->att, kc, vc,
+  src\brain_runtime.c:1534:                              (size_t)layer, pos, MAX_CONTEXT,
+  src\brain_runtime.c:1535:                              w->scores, w->weights)) return 0;
+  src\brain_runtime.c:1536:        snprintf(name, sizeof(name), "blk.%d.attn_output.weight", layer);
+  src\brain_runtime.c:1537:        TensorInfo ao;
+  src\brain_runtime.c:1538:        if (!find_tensor(g, name, &ao) || !tensor_matvec(g, &ao, w->att, w->proj)) return 0;
+  src\brain_runtime.c:1539:        for (int i = 0; i < HIDDEN_SIZE; ++i) w->x[i] += w->proj[i];
+  src\brain_runtime.c:1540:        snprintf(name, sizeof(name), "blk.%d.ffn_norm.weight", layer);
+  src\brain_runtime.c:1541:        if (!vector_named(g, name, w->norm, HIDDEN_SIZE)) return 0;
+  src\brain_runtime.c:1542:        rms_norm(w->x, w->norm, w->proj, HIDDEN_SIZE, RMS_EPS);
+  src\brain_runtime.c:1543:        char gate_name[96],up_name[96];
+  src\brain_runtime.c:1544:        snprintf(gate_name,sizeof(gate_name),"blk.%d.ffn_gate.weight",layer);
+  src\brain_runtime.c:1545:        snprintf(up_name,sizeof(up_name),"blk.%d.ffn_up.weight",layer);
+  src\brain_runtime.c:1546:        const char *ffn_names[2]={gate_name,up_name};
+  src\brain_runtime.c:1547:        float *ffn_outputs[2]={w->gate,w->up};
+  src\brain_runtime.c:1548:        if (!tensor_matvec_batch(g,ffn_names,ffn_outputs,2,w->proj)) return 0;
+  src\brain_runtime.c:1549:        for (int i = 0; i < FFN_SIZE; ++i) {
+  src\brain_runtime.c:1550:            float z = w->gate[i];
+  src\brain_runtime.c:1551:            w->ffn[i] = (z / (1.0f + expf(-z))) * w->up[i];
+  src\brain_runtime.c:1552:        }
+  src\brain_runtime.c:1553:        snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", layer);
+  src\brain_runtime.c:1554:        TensorInfo down;
+  src\brain_runtime.c:1555:        if (!find_tensor(g, name, &down) || !tensor_matvec(g, &down, w->ffn, w->proj)) return 0;
+  src\brain_runtime.c:1556:        for (int i = 0; i < HIDDEN_SIZE; ++i) w->x[i] += w->proj[i];
+  src\brain_runtime.c:1557:    }
+  src\brain_runtime.c:1558:    if (!vector_named(g, "output_norm.weight", w->norm, HIDDEN_SIZE)) return 0;
+  src\brain_runtime.c:1559:    rms_norm(w->x, w->norm, w->proj, HIDDEN_SIZE, RMS_EPS);
+  src\brain_runtime.c:1560:    if (want_logits) {
+  src\brain_runtime.c:1561:        TensorInfo out;
+  src\brain_runtime.c:1562:        if (!find_tensor(g, "output.weight", &out) || out.dims[1] != vocab ||
+  src\brain_runtime.c:1563:            !tensor_matvec(g, &out, w->proj, logits)) return 0;
+  src\brain_runtime.c:1564:    }
+  src\brain_runtime.c:1775:    float *kc=array_alloc((size_t)LAYERS*MAX_CONTEXT*KV_DIM,sizeof(float));
+  src\brain_runtime.c:1776:    float *vc=array_alloc((size_t)LAYERS*MAX_CONTEXT*KV_DIM,sizeof(float));
+  src\brain_runtime.c:1777:    float *logits=array_alloc((size_t)vocab,sizeof(float));
+  src\brain_runtime.c:1778:    float *active_logits=logits;
+  src\brain_runtime.c:1779:    int ok = 
+w.x&&w.norm&&w.q&&w.k&&w.v&&w.att&&w.proj&&w.gate&&w.up&&w.ffn&&w.bias&&w.scores&&w.weights&&kc&&vc&&logits;
+  src\brain_runtime.c:1780:    if (!ok) fprintf(stderr,"Inference workspace allocation failed\n");
+  src\brain_runtime.c:1781:    for (size_t i=0; ok && i<prompt_count; ++i) {
+  src\brain_runtime.c:1782:        if(!forward_token(&g,ids[i],i,kc,vc,&w,logits,vocab,i+1==prompt_count)) { ok=0; break; }
+  src\brain_runtime.c:1783:        fprintf(stderr,"Prompt: %zu/%zu tokens\n",i+1,prompt_count);
+  src\brain_runtime.c:1784:    }
+  src\brain_runtime.c:1785:    if (ok) {
+  src\brain_runtime.c:1786:        LARGE_INTEGER seed_counter; QueryPerformanceCounter(&seed_counter);
+  src\brain_runtime.c:1787:        uint64_t rng=(uint64_t)seed_counter.QuadPart ^ ((uint64_t)GetCurrentProcessId()<<32) ^ 
+GetTickCount64();
+  src\brain_runtime.c:1788:        if(!rng) rng=0x9e3779b97f4a7c15ULL;
+  src\brain_runtime.c:1789:        double confidence_sum=0.0;
+  src\brain_runtime.c:1790:        unsigned confidence_tokens=0;
+  src\brain_runtime.c:1791:        int hit_token_limit=1;
+  src\brain_runtime.c:1792:        for (unsigned step=0; step<gen_n; ++step) {
+  src\brain_runtime.c:1793:            float step_confidence=0.0f;
+  src\brain_runtime.c:1794:            uint32_t next=atlas_sample_token(active_logits,&tok,vocab,
+  src\brain_runtime.c:1795:                ids+prompt_count,step,step>=min_n,min_n==0,&rng,&step_confidence);
+  src\brain_runtime.c:1796:            if (!strcmp(tok.tokens[next],"<|im_end|>") || !strcmp(tok.tokens[next],"<|endoftext|>")) {
+  src\brain_runtime.c:1797:                hit_token_limit=0;
+  src\brain_runtime.c:1798:                break;
+  src\brain_runtime.c:1799:            }
+  src\brain_runtime.c:1800:            confidence_sum+=step_confidence; ++confidence_tokens;
+  src\brain_runtime.c:1801:            ids[prompt_count+step]=next;
+  src\brain_runtime.c:1802:            decode_token(&tok,next,stdout); fflush(stdout);
+  src\brain_runtime.c:1803:            if(step+1<gen_n && !forward_token(&g,next,prompt_count+step,kc,vc,&w,logits,vocab,1)) { ok=0; 
+break; }
+  src\brain_runtime.c:1804:        }
+  src\brain_runtime.c:1805:        fputc('\n',stdout); fflush(stdout);
+  src\brain_runtime.c:1806:        if(ok && emit_confidence) {
+  src\brain_runtime.c:1807:            float answer_confidence=confidence_tokens
+  src\brain_runtime.c:1808:                ?(float)(confidence_sum/confidence_tokens):0.0f;
+  src\brain_runtime.c:1809:            answer_confidence*=request_difficulty_factor(argv[2]);
+  src\brain_runtime.c:1810:            if(hit_token_limit) answer_confidence*=0.50f;
+  src\brain_runtime.c:1811:            fprintf(stdout,"\036ATLAS_CONFIDENCE=%.4f,TRUNCATED=%d\036\n",
+  src\brain_runtime.c:1812:                    answer_confidence,hit_token_limit);
+  src\brain_runtime.c:1813:        }
+  src\brain_runtime.c:1814:    }
+> src\brain_runtime.c:1815:    if (!ok) fprintf(stderr,"Inference failed: incompatible tensor or model data\n");
+  src\brain_runtime.c:1816:    free(ids); free(w.x); free(w.norm); free(w.q); free(w.k); free(w.v); free(w.att); free(w.proj);
+  src\brain_runtime.c:1817:    free(w.gate); free(w.up); free(w.ffn); free(w.bias); free(w.scores); free(w.weights); free(kc); 
+free(vc); free(logits);
+  src\brain_runtime.c:1818:    tokenizer_free(&tok);gguf_close(&g);brain_gpu_shutdown();ram_model_free();
+  src\brain_runtime.c:1819:    return ok?0:1;
+  src\brain_runtime.c:1820:}
+  src\brain_runtime.c:1821:
+  src\brain_runtime.c:1822:int wmain(int argc, wchar_t **wargv)
+  src\brain_runtime.c:1823:{
+  src\brain_runtime.c:1824:    char **argv = calloc((size_t)argc, sizeof(char *));
+  src\brain_runtime.c:1825:    if (!argv) return 1;
+  src\brain_runtime.c:1826:    for (int i = 0; i < argc; ++i) {
+  src\brain_runtime.c:1827:        int n = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, NULL, 0, NULL, NULL);
+  src\brain_runtime.c:1828:        if (n <= 0 || !(argv[i] = malloc((size_t)n)) ||
+  src\brain_runtime.c:1829:            !WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, argv[i], n, NULL, NULL)) {
+  src\brain_runtime.c:1830:            for (int j = 0; j <= i; ++j) free(argv[j]);
+  src\brain_runtime.c:1831:            free(argv); return 1;
+  src\brain_runtime.c:1832:        }
+  src\brain_runtime.c:1833:    }
+  src\brain_runtime.c:1834:    int result = run_main_utf8(argc, argv);
+  src\brain_runtime.c:1835:    for (int i = 0; i < argc; ++i) free(argv[i]);
+  src\brain_runtime.c:1836:    free(argv);
+  src\brain_runtime.c:1837:    return result;
+  src\brain_runtime.c:1838:}
+  src\brain_runtime.c:1839:#define LAYERS 24
+  src\brain_runtime.c:1840:#define FFN_SIZE 4096
+  src\brain_runtime.c:1841:
+  src\brain_runtime.c:1842:
+  src\brain_runtime.c:1843:
+  src\brain_runtime_batch.c:1454:            float z = gate[i];
+  src\brain_runtime_batch.c:1455:            ffn[i] = (z / (1.0f + expf(-z))) * up[i];
+  src\brain_runtime_batch.c:1456:        }
+  src\brain_runtime_batch.c:1457:        snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", layer);
+  src\brain_runtime_batch.c:1458:        TensorInfo down;
+  src\brain_runtime_batch.c:1459:        if (!find_tensor(&g, name, &down) || down.n_dims != 2 ||
+  src\brain_runtime_batch.c:1460:            down.dims[0] != FFN_SIZE || down.dims[1] != HIDDEN_SIZE ||
+  src\brain_runtime_batch.c:1461:            !tensor_matvec(&g, &down, ffn, proj)) goto tensor_error;
+  src\brain_runtime_batch.c:1462:        for (int i = 0; i < HIDDEN_SIZE; ++i) x[i] += proj[i];
+  src\brain_runtime_batch.c:1463:        if ((layer + 1) % 4 == 0) fprintf(stderr, "Completed layer %d/%d\n", layer + 1, LAYERS);
+  src\brain_runtime_batch.c:1464:#undef MAT
+  src\brain_runtime_batch.c:1465:    }
+  src\brain_runtime_batch.c:1466:
+  src\brain_runtime_batch.c:1467:    if (!vector_named(&g, "output_norm.weight", norm, HIDDEN_SIZE)) goto tensor_error;
+  src\brain_runtime_batch.c:1468:    rms_norm(x, norm, proj, HIDDEN_SIZE, RMS_EPS);
+  src\brain_runtime_batch.c:1469:    TensorInfo out;
+  src\brain_runtime_batch.c:1470:    if (!find_tensor(&g, "output.weight", &out) || out.n_dims != 2 ||
+  src\brain_runtime_batch.c:1471:        out.dims[0] != HIDDEN_SIZE || out.dims[1] > SIZE_MAX / sizeof(float)) goto tensor_error;
+  src\brain_runtime_batch.c:1472:    logits = malloc((size_t)out.dims[1] * sizeof(float));
+  src\brain_runtime_batch.c:1473:    if (!logits || !tensor_matvec(&g, &out, proj, logits)) goto tensor_error;
+  src\brain_runtime_batch.c:1474:    {
+  src\brain_runtime_batch.c:1475:        uint64_t best[5] = {0};
+  src\brain_runtime_batch.c:1476:        for (int j = 0; j < 5; ++j) best[j] = UINT64_MAX;
+  src\brain_runtime_batch.c:1477:        for (uint64_t i = 0; i < out.dims[1]; ++i) {
+  src\brain_runtime_batch.c:1478:            for (int j = 0; j < 5; ++j) {
+  src\brain_runtime_batch.c:1479:                if (best[j] == UINT64_MAX || logits[i] > logits[best[j]]) {
+  src\brain_runtime_batch.c:1480:                    for (int z = 4; z > j; --z) best[z] = best[z - 1];
+  src\brain_runtime_batch.c:1481:                    best[j] = i; break;
+  src\brain_runtime_batch.c:1482:                }
+  src\brain_runtime_batch.c:1483:            }
+  src\brain_runtime_batch.c:1484:        }
+  src\brain_runtime_batch.c:1485:        printf("Top token scores for input token %llu:\n", token);
+  src\brain_runtime_batch.c:1486:        for (int j = 0; j < 5; ++j)
+  src\brain_runtime_batch.c:1487:            printf("%d: token_id=%llu logit=%g\n", j + 1,
+  src\brain_runtime_batch.c:1488:                   (unsigned long long)best[j], logits[best[j]]);
+  src\brain_runtime_batch.c:1489:    }
+  src\brain_runtime_batch.c:1490:    ok = 1;
+  src\brain_runtime_batch.c:1491:    goto done;
+  src\brain_runtime_batch.c:1492:
+  src\brain_runtime_batch.c:1493:tensor_error:
+> src\brain_runtime_batch.c:1494:    fprintf(stderr, "Inference failed: missing, incompatible, or unreadable tensor\n");
+  src\brain_runtime_batch.c:1495:done:
+  src\brain_runtime_batch.c:1496:    free(x); free(norm); free(q); free(k); free(v); free(att); free(proj);
+  src\brain_runtime_batch.c:1497:    free(gate); free(up); free(ffn); free(logits);
+  src\brain_runtime_batch.c:1498:    gguf_close(&g);
+  src\brain_runtime_batch.c:1499:    ram_model_free();
+  src\brain_runtime_batch.c:1500:    return ok ? 0 : 1;
+  src\brain_runtime_batch.c:1501:}
+  src\brain_runtime_batch.c:1502:#endif
+  src\brain_runtime_batch.c:1503:
+  src\brain_runtime_batch.c:1504:#if defined(ATLAS_COMPACT)
+  src\brain_runtime_batch.c:1505:enum { FFN_SIZE = 4864, LAYERS = 24, MAX_CONTEXT = 2048 };
+  src\brain_runtime_batch.c:1506:#else
+  src\brain_runtime_batch.c:1507:enum { FFN_SIZE = 8960, LAYERS = 28, MAX_CONTEXT = 2048 };
+  src\brain_runtime_batch.c:1508:#endif
+  src\brain_runtime_batch.c:1509:typedef struct {
+  src\brain_runtime_batch.c:1510:    float *x, *norm, *q, *k, *v, *att, *proj, *gate, *up, *ffn, *bias;
+  src\brain_runtime_batch.c:1511:    float *scores, *weights;
+  src\brain_runtime_batch.c:1512:} Work;
+  src\brain_runtime_batch.c:1513:
+  src\brain_runtime_batch.c:1514:#define PREFILL_BATCH 32
+  src\brain_runtime_batch.c:1515:
+  src\brain_runtime_batch.c:1516:typedef struct {
+  src\brain_runtime_batch.c:1517:    GGUFFile *g; const TensorInfo *t; const float *input; float *output;
+  src\brain_runtime_batch.c:1518:    uint64_t blocks, first, last; size_t block_bytes, block_elements;
+  src\brain_runtime_batch.c:1519:    size_t cols, rows, batch;
+  src\brain_runtime_batch.c:1520:    volatile LONG failed;
+  src\brain_runtime_batch.c:1521:} BatchMatvecJob;
+  src\brain_runtime_batch.c:1522:
+  src\brain_runtime_batch.c:1523:/* input:  batch vectors, token-major, each `cols` floats
+  src\brain_runtime_batch.c:1524:   output: batch vectors, token-major, each `rows` floats */
+  src\brain_runtime_batch.c:1525:static void batch_matvec_rows(BatchMatvecJob *job)
+  src\brain_runtime_batch.c:1526:{
+  src\brain_runtime_batch.c:1527:    uint8_t block[Q6K_BYTES];
+  src\brain_runtime_batch.c:1528:    float weights[QK_K];
+  src\brain_runtime_batch.c:1529:    float sums[PREFILL_BATCH];
+  src\brain_runtime_batch.c:1530:    const size_t n = job->batch;
+  src\brain_runtime_batch.c:1531:    for (uint64_t row = job->first; row < job->last; ++row) {
+  src\brain_runtime_batch.c:1532:        for (size_t b = 0; b < n; ++b) sums[b] = 0.0f;
+  src\brain_runtime_batch.c:1533:        for (uint64_t blk = 0; blk < job->blocks; ++blk) {
+  src\brain_runtime_batch.c:1534:            uint64_t absolute = (uint64_t)job->g->data_base + job->t->offset +
+  src\brain_runtime_batch.c:1535:                (row * job->blocks + blk) * job->block_bytes;
+  src\brain_runtime_batch.c:1536:            if (absolute > g_ram_model.size ||
+  src\brain_runtime_batch.c:1537:                job->block_bytes > g_ram_model.size - (size_t)absolute) {
+  src\brain_runtime_batch.c:1538:                InterlockedExchange(&job->failed, 1);
+  src\brain_runtime_batch.c:1539:                break;
+  src\brain_runtime_batch.c:1540:            }
+  src\brain_runtime_batch.c:1541:            memcpy(block, g_ram_model.data + (size_t)absolute, job->block_bytes);
+  src\brain_runtime_batch.c:1542:            dequant_block(job->t->type, block, weights);   /* once per batch */
+  src\brain_runtime_batch.c:1543:            const size_t off = (size_t)blk * job->block_elements;
+  src\brain_runtime_batch.c:1544:            const size_t be = job->block_elements;
+  src\brain_runtime_batch.c:1545:            size_t b = 0;
+  src\brain_runtime_batch.c:1546:            /* four tokens at a time: four independent accumulators */
+  src\brain_runtime_batch.c:1547:            for (; b + 4 <= n; b += 4) {
+  src\brain_runtime_batch.c:1548:                const float *x0 = job->input + (b + 0) * job->cols + off;
+  src\brain_runtime_batch.c:1549:                const float *x1 = job->input + (b + 1) * job->cols + off;
+  src\brain_runtime_batch.c:1550:                const float *x2 = job->input + (b + 2) * job->cols + off;
+  src\brain_runtime_batch.c:1551:                const float *x3 = job->input + (b + 3) * job->cols + off;
+  src\brain_runtime_batch.c:1552:                float s0 = sums[b], s1 = sums[b + 1], s2 = sums[b + 2], s3 = sums[b + 3];
+  src\brain_runtime_batch.c:1553:                for (size_t i = 0; i < be; ++i) {
+  src\brain_runtime_batch.c:1554:                    float wv = weights[i];
+  src\brain_runtime_batch.c:1555:                    s0 += wv * x0[i]; s1 += wv * x1[i];
+  src\brain_runtime_batch.c:1556:                    s2 += wv * x2[i]; s3 += wv * x3[i];
+  src\brain_runtime_batch.c:1557:                }
+  src\brain_runtime_batch.c:1558:                sums[b] = s0; sums[b + 1] = s1; sums[b + 2] = s2; sums[b + 3] = s3;
+  src\brain_runtime_batch.c:1559:            }
+  src\brain_runtime_batch.c:1560:            for (; b < n; ++b) {
+  src\brain_runtime_batch.c:1561:                const float *x = job->input + b * job->cols + off;
+  src\brain_runtime_batch.c:1562:                float s = sums[b];
+  src\brain_runtime_batch.c:1563:                for (size_t i = 0; i < be; ++i) s += weights[i] * x[i];
+  src\brain_runtime_batch.c:1564:                sums[b] = s;
+  src\brain_runtime_batch.c:1565:            }
+  src\brain_runtime_batch.c:1566:        }
+  src\brain_runtime_batch.c:1567:        for (size_t b = 0; b < n; ++b) job->output[b * job->rows + row] = sums[b];
+  src\brain_runtime_batch.c:1568:    }
+  src\brain_runtime_batch.c:1569:}
+  src\brain_runtime_batch.c:1570:
+  src\brain_runtime_batch.c:1571:static VOID CALLBACK batch_matvec_cb(PTP_CALLBACK_INSTANCE inst, PVOID ctx, PTP_WORK work)
+  src\brain_runtime_batch.c:1572:{ (void)inst; (void)work; batch_matvec_rows((BatchMatvecJob *)ctx); }
+  src\brain_runtime_batch.c:1573:
+  src\brain_runtime_batch.c:1574:static int tensor_matvec_cpu_batch(GGUFFile *g, const TensorInfo *t,
+  src\brain_runtime_batch.c:2012:            done += n;
+  src\brain_runtime_batch.c:2013:            fprintf(stderr,"Prompt: %zu/%zu tokens\n",done,prompt_count);
+  src\brain_runtime_batch.c:2014:        }
+  src\brain_runtime_batch.c:2015:        prefill_work_free(&pw);
+  src\brain_runtime_batch.c:2016:    } else {
+  src\brain_runtime_batch.c:2017:        for (size_t i=0; ok && i<prompt_count; ++i) {
+  src\brain_runtime_batch.c:2018:            if(!forward_token(&g,ids[i],i,kc,vc,&w,logits,vocab,i+1==prompt_count)) { ok=0; break; }
+  src\brain_runtime_batch.c:2019:            fprintf(stderr,"Prompt: %zu/%zu tokens\n",i+1,prompt_count);
+  src\brain_runtime_batch.c:2020:        }
+  src\brain_runtime_batch.c:2021:    }
+  src\brain_runtime_batch.c:2022:    if (ok) {
+  src\brain_runtime_batch.c:2023:        double prefill_ms = now_ms() - t_prefill; fprintf(stderr, "[time] prefill %.0f ms for %zu 
+tokens (%.1f ms/token)\n", prefill_ms, prompt_count, prefill_ms / (double)prompt_count); double t_gen = now_ms(); LARGE_INTEGER 
+seed_counter; QueryPerformanceCounter(&seed_counter);
+  src\brain_runtime_batch.c:2024:        uint64_t rng=(uint64_t)seed_counter.QuadPart ^ ((uint64_t)GetCurrentProcessId()<<32) ^ 
+GetTickCount64();
+  src\brain_runtime_batch.c:2025:        if(!rng) rng=0x9e3779b97f4a7c15ULL;
+  src\brain_runtime_batch.c:2026:        double confidence_sum=0.0;
+  src\brain_runtime_batch.c:2027:        unsigned confidence_tokens=0;
+  src\brain_runtime_batch.c:2028:        int hit_token_limit=1;
+  src\brain_runtime_batch.c:2029:        for (unsigned step=0; step<gen_n; ++step) {
+  src\brain_runtime_batch.c:2030:            float step_confidence=0.0f;
+  src\brain_runtime_batch.c:2031:            uint32_t next=atlas_sample_token(active_logits,&tok,vocab,
+  src\brain_runtime_batch.c:2032:                ids+prompt_count,step,step>=min_n,min_n==0,&rng,&step_confidence);
+  src\brain_runtime_batch.c:2033:            if (!strcmp(tok.tokens[next],"<|im_end|>") || 
+!strcmp(tok.tokens[next],"<|endoftext|>")) {
+  src\brain_runtime_batch.c:2034:                hit_token_limit=0;
+  src\brain_runtime_batch.c:2035:                break;
+  src\brain_runtime_batch.c:2036:            }
+  src\brain_runtime_batch.c:2037:            confidence_sum+=step_confidence; ++confidence_tokens;
+  src\brain_runtime_batch.c:2038:            ids[prompt_count+step]=next;
+  src\brain_runtime_batch.c:2039:            decode_token(&tok,next,stdout); fflush(stdout);
+  src\brain_runtime_batch.c:2040:            if(step+1<gen_n && !forward_token(&g,next,prompt_count+step,kc,vc,&w,logits,vocab,1)) { 
+ok=0; break; }
+  src\brain_runtime_batch.c:2041:        }
+  src\brain_runtime_batch.c:2042:        fputc('\n',stdout); fflush(stdout);
+  src\brain_runtime_batch.c:2043:        double gen_ms = now_ms() - t_gen; if (confidence_tokens && gen_ms > 0) fprintf(stderr, 
+"[time] generation %.1f tokens/s (%u tokens)\n", confidence_tokens * 1000.0 / gen_ms, confidence_tokens); if(ok && emit_confidence) {
+  src\brain_runtime_batch.c:2044:            float answer_confidence=confidence_tokens
+  src\brain_runtime_batch.c:2045:                ?(float)(confidence_sum/confidence_tokens):0.0f;
+  src\brain_runtime_batch.c:2046:            answer_confidence*=request_difficulty_factor(argv[2]);
+  src\brain_runtime_batch.c:2047:            if(hit_token_limit) answer_confidence*=0.50f;
+  src\brain_runtime_batch.c:2048:            fprintf(stdout,"\036ATLAS_CONFIDENCE=%.4f,TRUNCATED=%d\036\n",
+  src\brain_runtime_batch.c:2049:                    answer_confidence,hit_token_limit);
+  src\brain_runtime_batch.c:2050:        }
+  src\brain_runtime_batch.c:2051:    }
+> src\brain_runtime_batch.c:2052:    if (!ok) fprintf(stderr,"Inference failed: incompatible tensor or model data\n");
+  src\brain_runtime_batch.c:2053:    free(ids); free(w.x); free(w.norm); free(w.q); free(w.k); free(w.v); free(w.att); free(w.proj);
+  src\brain_runtime_batch.c:2054:    free(w.gate); free(w.up); free(w.ffn); free(w.bias); free(w.scores); free(w.weights); free(kc); 
+free(vc); free(logits);
+  src\brain_runtime_batch.c:2055:    tokenizer_free(&tok);gguf_close(&g);brain_gpu_shutdown();ram_model_free();
+  src\brain_runtime_batch.c:2056:    return ok?0:1;
+  src\brain_runtime_batch.c:2057:}
+  src\brain_runtime_batch.c:2058:
+  src\brain_runtime_batch.c:2059:int wmain(int argc, wchar_t **wargv)
+  src\brain_runtime_batch.c:2060:{
+  src\brain_runtime_batch.c:2061:    char **argv = calloc((size_t)argc, sizeof(char *));
+  src\brain_runtime_batch.c:2062:    if (!argv) return 1;
+  src\brain_runtime_batch.c:2063:    for (int i = 0; i < argc; ++i) {
+  src\brain_runtime_batch.c:2064:        int n = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, NULL, 0, NULL, NULL);
+  src\brain_runtime_batch.c:2065:        if (n <= 0 || !(argv[i] = malloc((size_t)n)) ||
+  src\brain_runtime_batch.c:2066:            !WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, argv[i], n, NULL, NULL)) {
+  src\brain_runtime_batch.c:2067:            for (int j = 0; j <= i; ++j) free(argv[j]);
+  src\brain_runtime_batch.c:2068:            free(argv); return 1;
+  src\brain_runtime_batch.c:2069:        }
+  src\brain_runtime_batch.c:2070:    }
+  src\brain_runtime_batch.c:2071:    int result = run_main_utf8(argc, argv);
+  src\brain_runtime_batch.c:2072:    for (int i = 0; i < argc; ++i) free(argv[i]);
+  src\brain_runtime_batch.c:2073:    free(argv);
+  src\brain_runtime_batch.c:2074:    return result;
+  src\brain_runtime_batch.c:2075:}
+  src\brain_runtime_batch.c:2076:#define LAYERS 24
+  src\brain_runtime_batch.c:2077:#define FFN_SIZE 4096
+  src\brain_runtime_batch.c:2078:
+  src\brain_runtime_batch.c:2079:
+  src\brain_runtime_batch.c:2080:
+  src\brain_runtime_omp.c:1445:            float z = gate[i];
+  src\brain_runtime_omp.c:1446:            ffn[i] = (z / (1.0f + expf(-z))) * up[i];
+  src\brain_runtime_omp.c:1447:        }
+  src\brain_runtime_omp.c:1448:        snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", layer);
+  src\brain_runtime_omp.c:1449:        TensorInfo down;
+  src\brain_runtime_omp.c:1450:        if (!find_tensor(&g, name, &down) || down.n_dims != 2 ||
+  src\brain_runtime_omp.c:1451:            down.dims[0] != FFN_SIZE || down.dims[1] != HIDDEN_SIZE ||
+  src\brain_runtime_omp.c:1452:            !tensor_matvec(&g, &down, ffn, proj)) goto tensor_error;
+  src\brain_runtime_omp.c:1453:        for (int i = 0; i < HIDDEN_SIZE; ++i) x[i] += proj[i];
+  src\brain_runtime_omp.c:1454:        if ((layer + 1) % 4 == 0) fprintf(stderr, "Completed layer %d/%d\n", layer + 1, LAYERS);
+  src\brain_runtime_omp.c:1455:#undef MAT
+  src\brain_runtime_omp.c:1456:    }
+  src\brain_runtime_omp.c:1457:
+  src\brain_runtime_omp.c:1458:    if (!vector_named(&g, "output_norm.weight", norm, HIDDEN_SIZE)) goto tensor_error;
+  src\brain_runtime_omp.c:1459:    rms_norm(x, norm, proj, HIDDEN_SIZE, RMS_EPS);
+  src\brain_runtime_omp.c:1460:    TensorInfo out;
+  src\brain_runtime_omp.c:1461:    if (!find_tensor(&g, "output.weight", &out) || out.n_dims != 2 ||
+  src\brain_runtime_omp.c:1462:        out.dims[0] != HIDDEN_SIZE || out.dims[1] > SIZE_MAX / sizeof(float)) goto tensor_error;
+  src\brain_runtime_omp.c:1463:    logits = malloc((size_t)out.dims[1] * sizeof(float));
+  src\brain_runtime_omp.c:1464:    if (!logits || !tensor_matvec(&g, &out, proj, logits)) goto tensor_error;
+  src\brain_runtime_omp.c:1465:    {
+  src\brain_runtime_omp.c:1466:        uint64_t best[5] = {0};
+  src\brain_runtime_omp.c:1467:        for (int j = 0; j < 5; ++j) best[j] = UINT64_MAX;
+  src\brain_runtime_omp.c:1468:        for (uint64_t i = 0; i < out.dims[1]; ++i) {
+  src\brain_runtime_omp.c:1469:            for (int j = 0; j < 5; ++j) {
+  src\brain_runtime_omp.c:1470:                if (best[j] == UINT64_MAX || logits[i] > logits[best[j]]) {
+  src\brain_runtime_omp.c:1471:                    for (int z = 4; z > j; --z) best[z] = best[z - 1];
+  src\brain_runtime_omp.c:1472:                    best[j] = i; break;
+  src\brain_runtime_omp.c:1473:                }
+  src\brain_runtime_omp.c:1474:            }
+  src\brain_runtime_omp.c:1475:        }
+  src\brain_runtime_omp.c:1476:        printf("Top token scores for input token %llu:\n", token);
+  src\brain_runtime_omp.c:1477:        for (int j = 0; j < 5; ++j)
+  src\brain_runtime_omp.c:1478:            printf("%d: token_id=%llu logit=%g\n", j + 1,
+  src\brain_runtime_omp.c:1479:                   (unsigned long long)best[j], logits[best[j]]);
+  src\brain_runtime_omp.c:1480:    }
+  src\brain_runtime_omp.c:1481:    ok = 1;
+  src\brain_runtime_omp.c:1482:    goto done;
+  src\brain_runtime_omp.c:1483:
+  src\brain_runtime_omp.c:1484:tensor_error:
+> src\brain_runtime_omp.c:1485:    fprintf(stderr, "Inference failed: missing, incompatible, or unreadable tensor\n");
+  src\brain_runtime_omp.c:1486:done:
+  src\brain_runtime_omp.c:1487:    free(x); free(norm); free(q); free(k); free(v); free(att); free(proj);
+  src\brain_runtime_omp.c:1488:    free(gate); free(up); free(ffn); free(logits);
+  src\brain_runtime_omp.c:1489:    gguf_close(&g);
+  src\brain_runtime_omp.c:1490:    ram_model_free();
+  src\brain_runtime_omp.c:1491:    return ok ? 0 : 1;
+  src\brain_runtime_omp.c:1492:}
+  src\brain_runtime_omp.c:1493:#endif
+  src\brain_runtime_omp.c:1494:
+  src\brain_runtime_omp.c:1495:#if defined(ATLAS_COMPACT)
+  src\brain_runtime_omp.c:1496:enum { FFN_SIZE = 4864, LAYERS = 24, MAX_CONTEXT = 2048 };
+  src\brain_runtime_omp.c:1497:#else
+  src\brain_runtime_omp.c:1498:enum { FFN_SIZE = 8960, LAYERS = 28, MAX_CONTEXT = 2048 };
+  src\brain_runtime_omp.c:1499:#endif
+  src\brain_runtime_omp.c:1500:typedef struct {
+  src\brain_runtime_omp.c:1501:    float *x, *norm, *q, *k, *v, *att, *proj, *gate, *up, *ffn, *bias;
+  src\brain_runtime_omp.c:1502:    float *scores, *weights;
+  src\brain_runtime_omp.c:1503:} Work;
+  src\brain_runtime_omp.c:1504:
+  src\brain_runtime_omp.c:1505:static int forward_token(GGUFFile *g, uint32_t token, size_t pos,
+  src\brain_runtime_omp.c:1506:                         float *kc, float *vc, Work *w, float *logits,
+  src\brain_runtime_omp.c:1507:                         uint64_t vocab, int want_logits)
+  src\brain_runtime_omp.c:1508:{
+  src\brain_runtime_omp.c:1509:    TensorInfo emb;
+  src\brain_runtime_omp.c:1510:    if (!find_tensor(g, "token_embd.weight", &emb) || token >= emb.dims[1] ||
+  src\brain_runtime_omp.c:1511:        !load_embedding_row(g, &emb, token, w->x)) return 0;
+  src\brain_runtime_omp.c:1512:    for (int layer = 0; layer < LAYERS; ++layer) {
+  src\brain_runtime_omp.c:1513:        char name[96];
+  src\brain_runtime_omp.c:1514:        snprintf(name, sizeof(name), "blk.%d.attn_norm.weight", layer);
+  src\brain_runtime_omp.c:1515:        if (!vector_named(g, name, w->norm, HIDDEN_SIZE)) return 0;
+  src\brain_runtime_omp.c:1516:        rms_norm(w->x, w->norm, w->proj, HIDDEN_SIZE, RMS_EPS);
+  src\brain_runtime_omp.c:1517:        char q_name[96],k_name[96],v_name[96];
+  src\brain_runtime_omp.c:1518:        snprintf(q_name,sizeof(q_name),"blk.%d.attn_q.weight",layer);
+  src\brain_runtime_omp.c:1519:        snprintf(k_name,sizeof(k_name),"blk.%d.attn_k.weight",layer);
+  src\brain_runtime_omp.c:1520:        snprintf(v_name,sizeof(v_name),"blk.%d.attn_v.weight",layer);
+  src\brain_runtime_omp.c:1521:        const char *qkv_names[3]={q_name,k_name,v_name};
+  src\brain_runtime_omp.c:1522:        float *qkv_outputs[3]={w->q,w->k,w->v};
+  src\brain_runtime_omp.c:1523:        if (!tensor_matvec_batch(g,qkv_names,qkv_outputs,3,w->proj)) return 0;
+  src\brain_runtime_omp.c:1524:        snprintf(name, sizeof(name), "blk.%d.attn_q.bias", layer);
+  src\brain_runtime_omp.c:1525:        if (!vector_named(g, name, w->bias, Q_DIM)) return 0;
+  src\brain_runtime_omp.c:1526:        add_bias(w->q, w->bias, Q_DIM);
+  src\brain_runtime_omp.c:1527:        snprintf(name, sizeof(name), "blk.%d.attn_k.bias", layer);
+  src\brain_runtime_omp.c:1528:        if (!vector_named(g, name, w->bias, KV_DIM)) return 0;
+  src\brain_runtime_omp.c:1529:        add_bias(w->k, w->bias, KV_DIM);
+  src\brain_runtime_omp.c:1530:        snprintf(name, sizeof(name), "blk.%d.attn_v.bias", layer);
+  src\brain_runtime_omp.c:1531:        if (!vector_named(g, name, w->bias, KV_DIM)) return 0;
+  src\brain_runtime_omp.c:1532:        add_bias(w->v, w->bias, KV_DIM);
+  src\brain_runtime_omp.c:1533:        rope(w->q, w->k, Q_DIM, KV_DIM, (int)pos);
+  src\brain_runtime_omp.c:1534:        if (!gqa_single_token(w->q, w->k, w->v, w->att, kc, vc,
+  src\brain_runtime_omp.c:1535:                              (size_t)layer, pos, MAX_CONTEXT,
+  src\brain_runtime_omp.c:1536:                              w->scores, w->weights)) return 0;
+  src\brain_runtime_omp.c:1537:        snprintf(name, sizeof(name), "blk.%d.attn_output.weight", layer);
+  src\brain_runtime_omp.c:1538:        TensorInfo ao;
+  src\brain_runtime_omp.c:1539:        if (!find_tensor(g, name, &ao) || !tensor_matvec(g, &ao, w->att, w->proj)) return 0;
+  src\brain_runtime_omp.c:1540:        for (int i = 0; i < HIDDEN_SIZE; ++i) w->x[i] += w->proj[i];
+  src\brain_runtime_omp.c:1541:        snprintf(name, sizeof(name), "blk.%d.ffn_norm.weight", layer);
+  src\brain_runtime_omp.c:1542:        if (!vector_named(g, name, w->norm, HIDDEN_SIZE)) return 0;
+  src\brain_runtime_omp.c:1543:        rms_norm(w->x, w->norm, w->proj, HIDDEN_SIZE, RMS_EPS);
+  src\brain_runtime_omp.c:1544:        char gate_name[96],up_name[96];
+  src\brain_runtime_omp.c:1545:        snprintf(gate_name,sizeof(gate_name),"blk.%d.ffn_gate.weight",layer);
+  src\brain_runtime_omp.c:1546:        snprintf(up_name,sizeof(up_name),"blk.%d.ffn_up.weight",layer);
+  src\brain_runtime_omp.c:1547:        const char *ffn_names[2]={gate_name,up_name};
+  src\brain_runtime_omp.c:1548:        float *ffn_outputs[2]={w->gate,w->up};
+  src\brain_runtime_omp.c:1549:        if (!tensor_matvec_batch(g,ffn_names,ffn_outputs,2,w->proj)) return 0;
+  src\brain_runtime_omp.c:1550:        for (int i = 0; i < FFN_SIZE; ++i) {
+  src\brain_runtime_omp.c:1551:            float z = w->gate[i];
+  src\brain_runtime_omp.c:1552:            w->ffn[i] = (z / (1.0f + expf(-z))) * w->up[i];
+  src\brain_runtime_omp.c:1553:        }
+  src\brain_runtime_omp.c:1554:        snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", layer);
+  src\brain_runtime_omp.c:1555:        TensorInfo down;
+  src\brain_runtime_omp.c:1556:        if (!find_tensor(g, name, &down) || !tensor_matvec(g, &down, w->ffn, w->proj)) return 0;
+  src\brain_runtime_omp.c:1557:        for (int i = 0; i < HIDDEN_SIZE; ++i) w->x[i] += w->proj[i];
+  src\brain_runtime_omp.c:1558:    }
+  src\brain_runtime_omp.c:1559:    if (!vector_named(g, "output_norm.weight", w->norm, HIDDEN_SIZE)) return 0;
+  src\brain_runtime_omp.c:1560:    rms_norm(w->x, w->norm, w->proj, HIDDEN_SIZE, RMS_EPS);
+  src\brain_runtime_omp.c:1561:    if (want_logits) {
+  src\brain_runtime_omp.c:1562:        TensorInfo out;
+  src\brain_runtime_omp.c:1563:        if (!find_tensor(g, "output.weight", &out) || out.dims[1] != vocab ||
+  src\brain_runtime_omp.c:1564:            !tensor_matvec(g, &out, w->proj, logits)) return 0;
+  src\brain_runtime_omp.c:1565:    }
+  src\brain_runtime_omp.c:1781:    float *kc=array_alloc((size_t)LAYERS*MAX_CONTEXT*KV_DIM,sizeof(float));
+  src\brain_runtime_omp.c:1782:    float *vc=array_alloc((size_t)LAYERS*MAX_CONTEXT*KV_DIM,sizeof(float));
+  src\brain_runtime_omp.c:1783:    float *logits=array_alloc((size_t)vocab,sizeof(float));
+  src\brain_runtime_omp.c:1784:    float *active_logits=logits;
+  src\brain_runtime_omp.c:1785:    int ok = 
+w.x&&w.norm&&w.q&&w.k&&w.v&&w.att&&w.proj&&w.gate&&w.up&&w.ffn&&w.bias&&w.scores&&w.weights&&kc&&vc&&logits;
+  src\brain_runtime_omp.c:1786:    if (!ok) fprintf(stderr,"Inference workspace allocation failed\n");
+  src\brain_runtime_omp.c:1787:    double t_prefill = now_ms(); for (size_t i=0; ok && i<prompt_count; ++i) {
+  src\brain_runtime_omp.c:1788:        if(!forward_token(&g,ids[i],i,kc,vc,&w,logits,vocab,i+1==prompt_count)) { ok=0; break; }
+  src\brain_runtime_omp.c:1789:        fprintf(stderr,"Prompt: %zu/%zu tokens\n",i+1,prompt_count);
+  src\brain_runtime_omp.c:1790:    }
+  src\brain_runtime_omp.c:1791:    if (ok) {
+  src\brain_runtime_omp.c:1792:        double prefill_ms = now_ms() - t_prefill; fprintf(stderr, "[time] prefill %.0f ms for %zu 
+tokens (%.1f ms/token)\n", prefill_ms, prompt_count, prefill_ms / (double)prompt_count); double t_gen = now_ms(); LARGE_INTEGER 
+seed_counter; QueryPerformanceCounter(&seed_counter);
+  src\brain_runtime_omp.c:1793:        uint64_t rng=(uint64_t)seed_counter.QuadPart ^ ((uint64_t)GetCurrentProcessId()<<32) ^ 
+GetTickCount64();
+  src\brain_runtime_omp.c:1794:        if(!rng) rng=0x9e3779b97f4a7c15ULL;
+  src\brain_runtime_omp.c:1795:        double confidence_sum=0.0;
+  src\brain_runtime_omp.c:1796:        unsigned confidence_tokens=0;
+  src\brain_runtime_omp.c:1797:        int hit_token_limit=1;
+  src\brain_runtime_omp.c:1798:        for (unsigned step=0; step<gen_n; ++step) {
+  src\brain_runtime_omp.c:1799:            float step_confidence=0.0f;
+  src\brain_runtime_omp.c:1800:            uint32_t next=atlas_sample_token(active_logits,&tok,vocab,
+  src\brain_runtime_omp.c:1801:                ids+prompt_count,step,step>=min_n,min_n==0,&rng,&step_confidence);
+  src\brain_runtime_omp.c:1802:            if (!strcmp(tok.tokens[next],"<|im_end|>") || !strcmp(tok.tokens[next],"<|endoftext|>")) {
+  src\brain_runtime_omp.c:1803:                hit_token_limit=0;
+  src\brain_runtime_omp.c:1804:                break;
+  src\brain_runtime_omp.c:1805:            }
+  src\brain_runtime_omp.c:1806:            confidence_sum+=step_confidence; ++confidence_tokens;
+  src\brain_runtime_omp.c:1807:            ids[prompt_count+step]=next;
+  src\brain_runtime_omp.c:1808:            decode_token(&tok,next,stdout); fflush(stdout);
+  src\brain_runtime_omp.c:1809:            if(step+1<gen_n && !forward_token(&g,next,prompt_count+step,kc,vc,&w,logits,vocab,1)) { 
+ok=0; break; }
+  src\brain_runtime_omp.c:1810:        }
+  src\brain_runtime_omp.c:1811:        fputc('\n',stdout); fflush(stdout);
+  src\brain_runtime_omp.c:1812:        double gen_ms = now_ms() - t_gen; if (confidence_tokens && gen_ms > 0) fprintf(stderr, 
+"[time] generation %.1f tokens/s (%u tokens)\n", confidence_tokens * 1000.0 / gen_ms, confidence_tokens); if(ok && emit_confidence) {
+  src\brain_runtime_omp.c:1813:            float answer_confidence=confidence_tokens
+  src\brain_runtime_omp.c:1814:                ?(float)(confidence_sum/confidence_tokens):0.0f;
+  src\brain_runtime_omp.c:1815:            answer_confidence*=request_difficulty_factor(argv[2]);
+  src\brain_runtime_omp.c:1816:            if(hit_token_limit) answer_confidence*=0.50f;
+  src\brain_runtime_omp.c:1817:            fprintf(stdout,"\036ATLAS_CONFIDENCE=%.4f,TRUNCATED=%d\036\n",
+  src\brain_runtime_omp.c:1818:                    answer_confidence,hit_token_limit);
+  src\brain_runtime_omp.c:1819:        }
+  src\brain_runtime_omp.c:1820:    }
+> src\brain_runtime_omp.c:1821:    if (!ok) fprintf(stderr,"Inference failed: incompatible tensor or model data\n");
+  src\brain_runtime_omp.c:1822:    free(ids); free(w.x); free(w.norm); free(w.q); free(w.k); free(w.v); free(w.att); free(w.proj);
+  src\brain_runtime_omp.c:1823:    free(w.gate); free(w.up); free(w.ffn); free(w.bias); free(w.scores); free(w.weights); free(kc); 
+free(vc); free(logits);
+  src\brain_runtime_omp.c:1824:    tokenizer_free(&tok);gguf_close(&g);brain_gpu_shutdown();ram_model_free();
+  src\brain_runtime_omp.c:1825:    return ok?0:1;
+  src\brain_runtime_omp.c:1826:}
+  src\brain_runtime_omp.c:1827:
+  src\brain_runtime_omp.c:1828:int wmain(int argc, wchar_t **wargv)
+  src\brain_runtime_omp.c:1829:{
+  src\brain_runtime_omp.c:1830:    char **argv = calloc((size_t)argc, sizeof(char *));
+  src\brain_runtime_omp.c:1831:    if (!argv) return 1;
+  src\brain_runtime_omp.c:1832:    for (int i = 0; i < argc; ++i) {
+  src\brain_runtime_omp.c:1833:        int n = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, NULL, 0, NULL, NULL);
+  src\brain_runtime_omp.c:1834:        if (n <= 0 || !(argv[i] = malloc((size_t)n)) ||
+  src\brain_runtime_omp.c:1835:            !WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, argv[i], n, NULL, NULL)) {
+  src\brain_runtime_omp.c:1836:            for (int j = 0; j <= i; ++j) free(argv[j]);
+  src\brain_runtime_omp.c:1837:            free(argv); return 1;
+  src\brain_runtime_omp.c:1838:        }
+  src\brain_runtime_omp.c:1839:    }
+  src\brain_runtime_omp.c:1840:    int result = run_main_utf8(argc, argv);
+  src\brain_runtime_omp.c:1841:    for (int i = 0; i < argc; ++i) free(argv[i]);
+  src\brain_runtime_omp.c:1842:    free(argv);
+  src\brain_runtime_omp.c:1843:    return result;
+  src\brain_runtime_omp.c:1844:}
+  src\brain_runtime_omp.c:1845:#define LAYERS 24
+  src\brain_runtime_omp.c:1846:#define FFN_SIZE 4096
+  src\brain_runtime_omp.c:1847:
+  src\brain_runtime_omp.c:1848:
+  src\brain_runtime_omp.c:1849:
+  src\brain_runtime_pool.c:1454:            float z = gate[i];
+  src\brain_runtime_pool.c:1455:            ffn[i] = (z / (1.0f + expf(-z))) * up[i];
+  src\brain_runtime_pool.c:1456:        }
+  src\brain_runtime_pool.c:1457:        snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", layer);
+  src\brain_runtime_pool.c:1458:        TensorInfo down;
+  src\brain_runtime_pool.c:1459:        if (!find_tensor(&g, name, &down) || down.n_dims != 2 ||
+  src\brain_runtime_pool.c:1460:            down.dims[0] != FFN_SIZE || down.dims[1] != HIDDEN_SIZE ||
+  src\brain_runtime_pool.c:1461:            !tensor_matvec(&g, &down, ffn, proj)) goto tensor_error;
+  src\brain_runtime_pool.c:1462:        for (int i = 0; i < HIDDEN_SIZE; ++i) x[i] += proj[i];
+  src\brain_runtime_pool.c:1463:        if ((layer + 1) % 4 == 0) fprintf(stderr, "Completed layer %d/%d\n", layer + 1, LAYERS);
+  src\brain_runtime_pool.c:1464:#undef MAT
+  src\brain_runtime_pool.c:1465:    }
+  src\brain_runtime_pool.c:1466:
+  src\brain_runtime_pool.c:1467:    if (!vector_named(&g, "output_norm.weight", norm, HIDDEN_SIZE)) goto tensor_error;
+  src\brain_runtime_pool.c:1468:    rms_norm(x, norm, proj, HIDDEN_SIZE, RMS_EPS);
+  src\brain_runtime_pool.c:1469:    TensorInfo out;
+  src\brain_runtime_pool.c:1470:    if (!find_tensor(&g, "output.weight", &out) || out.n_dims != 2 ||
+  src\brain_runtime_pool.c:1471:        out.dims[0] != HIDDEN_SIZE || out.dims[1] > SIZE_MAX / sizeof(float)) goto tensor_error;
+  src\brain_runtime_pool.c:1472:    logits = malloc((size_t)out.dims[1] * sizeof(float));
+  src\brain_runtime_pool.c:1473:    if (!logits || !tensor_matvec(&g, &out, proj, logits)) goto tensor_error;
+  src\brain_runtime_pool.c:1474:    {
+  src\brain_runtime_pool.c:1475:        uint64_t best[5] = {0};
+  src\brain_runtime_pool.c:1476:        for (int j = 0; j < 5; ++j) best[j] = UINT64_MAX;
+  src\brain_runtime_pool.c:1477:        for (uint64_t i = 0; i < out.dims[1]; ++i) {
+  src\brain_runtime_pool.c:1478:            for (int j = 0; j < 5; ++j) {
+  src\brain_runtime_pool.c:1479:                if (best[j] == UINT64_MAX || logits[i] > logits[best[j]]) {
+  src\brain_runtime_pool.c:1480:                    for (int z = 4; z > j; --z) best[z] = best[z - 1];
+  src\brain_runtime_pool.c:1481:                    best[j] = i; break;
+  src\brain_runtime_pool.c:1482:                }
+  src\brain_runtime_pool.c:1483:            }
+  src\brain_runtime_pool.c:1484:        }
+  src\brain_runtime_pool.c:1485:        printf("Top token scores for input token %llu:\n", token);
+  src\brain_runtime_pool.c:1486:        for (int j = 0; j < 5; ++j)
+  src\brain_runtime_pool.c:1487:            printf("%d: token_id=%llu logit=%g\n", j + 1,
+  src\brain_runtime_pool.c:1488:                   (unsigned long long)best[j], logits[best[j]]);
+  src\brain_runtime_pool.c:1489:    }
+  src\brain_runtime_pool.c:1490:    ok = 1;
+  src\brain_runtime_pool.c:1491:    goto done;
+  src\brain_runtime_pool.c:1492:
+  src\brain_runtime_pool.c:1493:tensor_error:
+> src\brain_runtime_pool.c:1494:    fprintf(stderr, "Inference failed: missing, incompatible, or unreadable tensor\n");
+  src\brain_runtime_pool.c:1495:done:
+  src\brain_runtime_pool.c:1496:    free(x); free(norm); free(q); free(k); free(v); free(att); free(proj);
+  src\brain_runtime_pool.c:1497:    free(gate); free(up); free(ffn); free(logits);
+  src\brain_runtime_pool.c:1498:    gguf_close(&g);
+  src\brain_runtime_pool.c:1499:    ram_model_free();
+  src\brain_runtime_pool.c:1500:    return ok ? 0 : 1;
+  src\brain_runtime_pool.c:1501:}
+  src\brain_runtime_pool.c:1502:#endif
+  src\brain_runtime_pool.c:1503:
+  src\brain_runtime_pool.c:1504:#if defined(ATLAS_COMPACT)
+  src\brain_runtime_pool.c:1505:enum { FFN_SIZE = 4864, LAYERS = 24, MAX_CONTEXT = 2048 };
+  src\brain_runtime_pool.c:1506:#else
+  src\brain_runtime_pool.c:1507:enum { FFN_SIZE = 8960, LAYERS = 28, MAX_CONTEXT = 2048 };
+  src\brain_runtime_pool.c:1508:#endif
+  src\brain_runtime_pool.c:1509:typedef struct {
+  src\brain_runtime_pool.c:1510:    float *x, *norm, *q, *k, *v, *att, *proj, *gate, *up, *ffn, *bias;
+  src\brain_runtime_pool.c:1511:    float *scores, *weights;
+  src\brain_runtime_pool.c:1512:} Work;
+  src\brain_runtime_pool.c:1513:
+  src\brain_runtime_pool.c:1514:static int forward_token(GGUFFile *g, uint32_t token, size_t pos,
+  src\brain_runtime_pool.c:1515:                         float *kc, float *vc, Work *w, float *logits,
+  src\brain_runtime_pool.c:1516:                         uint64_t vocab, int want_logits)
+  src\brain_runtime_pool.c:1517:{
+  src\brain_runtime_pool.c:1518:    TensorInfo emb;
+  src\brain_runtime_pool.c:1519:    if (!find_tensor(g, "token_embd.weight", &emb) || token >= emb.dims[1] ||
+  src\brain_runtime_pool.c:1520:        !load_embedding_row(g, &emb, token, w->x)) return 0;
+  src\brain_runtime_pool.c:1521:    for (int layer = 0; layer < LAYERS; ++layer) {
+  src\brain_runtime_pool.c:1522:        char name[96];
+  src\brain_runtime_pool.c:1523:        snprintf(name, sizeof(name), "blk.%d.attn_norm.weight", layer);
+  src\brain_runtime_pool.c:1524:        if (!vector_named(g, name, w->norm, HIDDEN_SIZE)) return 0;
+  src\brain_runtime_pool.c:1525:        rms_norm(w->x, w->norm, w->proj, HIDDEN_SIZE, RMS_EPS);
+  src\brain_runtime_pool.c:1526:        char q_name[96],k_name[96],v_name[96];
+  src\brain_runtime_pool.c:1527:        snprintf(q_name,sizeof(q_name),"blk.%d.attn_q.weight",layer);
+  src\brain_runtime_pool.c:1528:        snprintf(k_name,sizeof(k_name),"blk.%d.attn_k.weight",layer);
+  src\brain_runtime_pool.c:1529:        snprintf(v_name,sizeof(v_name),"blk.%d.attn_v.weight",layer);
+  src\brain_runtime_pool.c:1530:        const char *qkv_names[3]={q_name,k_name,v_name};
+  src\brain_runtime_pool.c:1531:        float *qkv_outputs[3]={w->q,w->k,w->v};
+  src\brain_runtime_pool.c:1532:        if (!tensor_matvec_batch(g,qkv_names,qkv_outputs,3,w->proj)) return 0;
+  src\brain_runtime_pool.c:1533:        snprintf(name, sizeof(name), "blk.%d.attn_q.bias", layer);
+  src\brain_runtime_pool.c:1534:        if (!vector_named(g, name, w->bias, Q_DIM)) return 0;
+  src\brain_runtime_pool.c:1535:        add_bias(w->q, w->bias, Q_DIM);
+  src\brain_runtime_pool.c:1536:        snprintf(name, sizeof(name), "blk.%d.attn_k.bias", layer);
+  src\brain_runtime_pool.c:1537:        if (!vector_named(g, name, w->bias, KV_DIM)) return 0;
+  src\brain_runtime_pool.c:1538:        add_bias(w->k, w->bias, KV_DIM);
+  src\brain_runtime_pool.c:1539:        snprintf(name, sizeof(name), "blk.%d.attn_v.bias", layer);
+  src\brain_runtime_pool.c:1540:        if (!vector_named(g, name, w->bias, KV_DIM)) return 0;
+  src\brain_runtime_pool.c:1541:        add_bias(w->v, w->bias, KV_DIM);
+  src\brain_runtime_pool.c:1542:        rope(w->q, w->k, Q_DIM, KV_DIM, (int)pos);
+  src\brain_runtime_pool.c:1543:        if (!gqa_single_token(w->q, w->k, w->v, w->att, kc, vc,
+  src\brain_runtime_pool.c:1544:                              (size_t)layer, pos, MAX_CONTEXT,
+  src\brain_runtime_pool.c:1545:                              w->scores, w->weights)) return 0;
+  src\brain_runtime_pool.c:1546:        snprintf(name, sizeof(name), "blk.%d.attn_output.weight", layer);
+  src\brain_runtime_pool.c:1547:        TensorInfo ao;
+  src\brain_runtime_pool.c:1548:        if (!find_tensor(g, name, &ao) || !tensor_matvec(g, &ao, w->att, w->proj)) return 0;
+  src\brain_runtime_pool.c:1549:        for (int i = 0; i < HIDDEN_SIZE; ++i) w->x[i] += w->proj[i];
+  src\brain_runtime_pool.c:1550:        snprintf(name, sizeof(name), "blk.%d.ffn_norm.weight", layer);
+  src\brain_runtime_pool.c:1551:        if (!vector_named(g, name, w->norm, HIDDEN_SIZE)) return 0;
+  src\brain_runtime_pool.c:1552:        rms_norm(w->x, w->norm, w->proj, HIDDEN_SIZE, RMS_EPS);
+  src\brain_runtime_pool.c:1553:        char gate_name[96],up_name[96];
+  src\brain_runtime_pool.c:1554:        snprintf(gate_name,sizeof(gate_name),"blk.%d.ffn_gate.weight",layer);
+  src\brain_runtime_pool.c:1555:        snprintf(up_name,sizeof(up_name),"blk.%d.ffn_up.weight",layer);
+  src\brain_runtime_pool.c:1556:        const char *ffn_names[2]={gate_name,up_name};
+  src\brain_runtime_pool.c:1557:        float *ffn_outputs[2]={w->gate,w->up};
+  src\brain_runtime_pool.c:1558:        if (!tensor_matvec_batch(g,ffn_names,ffn_outputs,2,w->proj)) return 0;
+  src\brain_runtime_pool.c:1559:        for (int i = 0; i < FFN_SIZE; ++i) {
+  src\brain_runtime_pool.c:1560:            float z = w->gate[i];
+  src\brain_runtime_pool.c:1561:            w->ffn[i] = (z / (1.0f + expf(-z))) * w->up[i];
+  src\brain_runtime_pool.c:1562:        }
+  src\brain_runtime_pool.c:1563:        snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", layer);
+  src\brain_runtime_pool.c:1564:        TensorInfo down;
+  src\brain_runtime_pool.c:1565:        if (!find_tensor(g, name, &down) || !tensor_matvec(g, &down, w->ffn, w->proj)) return 0;
+  src\brain_runtime_pool.c:1566:        for (int i = 0; i < HIDDEN_SIZE; ++i) w->x[i] += w->proj[i];
+  src\brain_runtime_pool.c:1567:    }
+  src\brain_runtime_pool.c:1568:    if (!vector_named(g, "output_norm.weight", w->norm, HIDDEN_SIZE)) return 0;
+  src\brain_runtime_pool.c:1569:    rms_norm(w->x, w->norm, w->proj, HIDDEN_SIZE, RMS_EPS);
+  src\brain_runtime_pool.c:1570:    if (want_logits) {
+  src\brain_runtime_pool.c:1571:        TensorInfo out;
+  src\brain_runtime_pool.c:1572:        if (!find_tensor(g, "output.weight", &out) || out.dims[1] != vocab ||
+  src\brain_runtime_pool.c:1573:            !tensor_matvec(g, &out, w->proj, logits)) return 0;
+  src\brain_runtime_pool.c:1574:    }
+  src\brain_runtime_pool.c:1790:    float *kc=array_alloc((size_t)LAYERS*MAX_CONTEXT*KV_DIM,sizeof(float));
+  src\brain_runtime_pool.c:1791:    float *vc=array_alloc((size_t)LAYERS*MAX_CONTEXT*KV_DIM,sizeof(float));
+  src\brain_runtime_pool.c:1792:    float *logits=array_alloc((size_t)vocab,sizeof(float));
+  src\brain_runtime_pool.c:1793:    float *active_logits=logits;
+  src\brain_runtime_pool.c:1794:    int ok = 
+w.x&&w.norm&&w.q&&w.k&&w.v&&w.att&&w.proj&&w.gate&&w.up&&w.ffn&&w.bias&&w.scores&&w.weights&&kc&&vc&&logits;
+  src\brain_runtime_pool.c:1795:    if (!ok) fprintf(stderr,"Inference workspace allocation failed\n");
+  src\brain_runtime_pool.c:1796:    double t_prefill = now_ms(); for (size_t i=0; ok && i<prompt_count; ++i) {
+  src\brain_runtime_pool.c:1797:        if(!forward_token(&g,ids[i],i,kc,vc,&w,logits,vocab,i+1==prompt_count)) { ok=0; break; }
+  src\brain_runtime_pool.c:1798:        fprintf(stderr,"Prompt: %zu/%zu tokens\n",i+1,prompt_count);
+  src\brain_runtime_pool.c:1799:    }
+  src\brain_runtime_pool.c:1800:    if (ok) {
+  src\brain_runtime_pool.c:1801:        double prefill_ms = now_ms() - t_prefill; fprintf(stderr, "[time] prefill %.0f ms for %zu 
+tokens (%.1f ms/token)\n", prefill_ms, prompt_count, prefill_ms / (double)prompt_count); double t_gen = now_ms(); LARGE_INTEGER 
+seed_counter; QueryPerformanceCounter(&seed_counter);
+  src\brain_runtime_pool.c:1802:        uint64_t rng=(uint64_t)seed_counter.QuadPart ^ ((uint64_t)GetCurrentProcessId()<<32) ^ 
+GetTickCount64();
+  src\brain_runtime_pool.c:1803:        if(!rng) rng=0x9e3779b97f4a7c15ULL;
+  src\brain_runtime_pool.c:1804:        double confidence_sum=0.0;
+  src\brain_runtime_pool.c:1805:        unsigned confidence_tokens=0;
+  src\brain_runtime_pool.c:1806:        int hit_token_limit=1;
+  src\brain_runtime_pool.c:1807:        for (unsigned step=0; step<gen_n; ++step) {
+  src\brain_runtime_pool.c:1808:            float step_confidence=0.0f;
+  src\brain_runtime_pool.c:1809:            uint32_t next=atlas_sample_token(active_logits,&tok,vocab,
+  src\brain_runtime_pool.c:1810:                ids+prompt_count,step,step>=min_n,min_n==0,&rng,&step_confidence);
+  src\brain_runtime_pool.c:1811:            if (!strcmp(tok.tokens[next],"<|im_end|>") || !strcmp(tok.tokens[next],"<|endoftext|>")) 
+{
+  src\brain_runtime_pool.c:1812:                hit_token_limit=0;
+  src\brain_runtime_pool.c:1813:                break;
+  src\brain_runtime_pool.c:1814:            }
+  src\brain_runtime_pool.c:1815:            confidence_sum+=step_confidence; ++confidence_tokens;
+  src\brain_runtime_pool.c:1816:            ids[prompt_count+step]=next;
+  src\brain_runtime_pool.c:1817:            decode_token(&tok,next,stdout); fflush(stdout);
+  src\brain_runtime_pool.c:1818:            if(step+1<gen_n && !forward_token(&g,next,prompt_count+step,kc,vc,&w,logits,vocab,1)) { 
+ok=0; break; }
+  src\brain_runtime_pool.c:1819:        }
+  src\brain_runtime_pool.c:1820:        fputc('\n',stdout); fflush(stdout);
+  src\brain_runtime_pool.c:1821:        double gen_ms = now_ms() - t_gen; if (confidence_tokens && gen_ms > 0) fprintf(stderr, 
+"[time] generation %.1f tokens/s (%u tokens)\n", confidence_tokens * 1000.0 / gen_ms, confidence_tokens); if(ok && emit_confidence) {
+  src\brain_runtime_pool.c:1822:            float answer_confidence=confidence_tokens
+  src\brain_runtime_pool.c:1823:                ?(float)(confidence_sum/confidence_tokens):0.0f;
+  src\brain_runtime_pool.c:1824:            answer_confidence*=request_difficulty_factor(argv[2]);
+  src\brain_runtime_pool.c:1825:            if(hit_token_limit) answer_confidence*=0.50f;
+  src\brain_runtime_pool.c:1826:            fprintf(stdout,"\036ATLAS_CONFIDENCE=%.4f,TRUNCATED=%d\036\n",
+  src\brain_runtime_pool.c:1827:                    answer_confidence,hit_token_limit);
+  src\brain_runtime_pool.c:1828:        }
+  src\brain_runtime_pool.c:1829:    }
+> src\brain_runtime_pool.c:1830:    if (!ok) fprintf(stderr,"Inference failed: incompatible tensor or model data\n");
+  src\brain_runtime_pool.c:1831:    free(ids); free(w.x); free(w.norm); free(w.q); free(w.k); free(w.v); free(w.att); free(w.proj);
+  src\brain_runtime_pool.c:1832:    free(w.gate); free(w.up); free(w.ffn); free(w.bias); free(w.scores); free(w.weights); free(kc); 
+free(vc); free(logits);
+  src\brain_runtime_pool.c:1833:    tokenizer_free(&tok);gguf_close(&g);brain_gpu_shutdown();ram_model_free();
+  src\brain_runtime_pool.c:1834:    return ok?0:1;
+  src\brain_runtime_pool.c:1835:}
+  src\brain_runtime_pool.c:1836:
+  src\brain_runtime_pool.c:1837:int wmain(int argc, wchar_t **wargv)
+  src\brain_runtime_pool.c:1838:{
+  src\brain_runtime_pool.c:1839:    char **argv = calloc((size_t)argc, sizeof(char *));
+  src\brain_runtime_pool.c:1840:    if (!argv) return 1;
+  src\brain_runtime_pool.c:1841:    for (int i = 0; i < argc; ++i) {
+  src\brain_runtime_pool.c:1842:        int n = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, NULL, 0, NULL, NULL);
+  src\brain_runtime_pool.c:1843:        if (n <= 0 || !(argv[i] = malloc((size_t)n)) ||
+  src\brain_runtime_pool.c:1844:            !WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, argv[i], n, NULL, NULL)) {
+  src\brain_runtime_pool.c:1845:            for (int j = 0; j <= i; ++j) free(argv[j]);
+  src\brain_runtime_pool.c:1846:            free(argv); return 1;
+  src\brain_runtime_pool.c:1847:        }
+  src\brain_runtime_pool.c:1848:    }
+  src\brain_runtime_pool.c:1849:    int result = run_main_utf8(argc, argv);
+  src\brain_runtime_pool.c:1850:    for (int i = 0; i < argc; ++i) free(argv[i]);
+  src\brain_runtime_pool.c:1851:    free(argv);
+  src\brain_runtime_pool.c:1852:    return result;
+  src\brain_runtime_pool.c:1853:}
+  src\brain_runtime_pool.c:1854:#define LAYERS 24
+  src\brain_runtime_pool.c:1855:#define FFN_SIZE 4096
+  src\brain_runtime_pool.c:1856:
+  src\brain_runtime_pool.c:1857:
+  src\brain_runtime_pool.c:1858:
+  src\brain_runtime_timed.c:1444:            float z = gate[i];
+  src\brain_runtime_timed.c:1445:            ffn[i] = (z / (1.0f + expf(-z))) * up[i];
+  src\brain_runtime_timed.c:1446:        }
+  src\brain_runtime_timed.c:1447:        snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", layer);
+  src\brain_runtime_timed.c:1448:        TensorInfo down;
+  src\brain_runtime_timed.c:1449:        if (!find_tensor(&g, name, &down) || down.n_dims != 2 ||
+  src\brain_runtime_timed.c:1450:            down.dims[0] != FFN_SIZE || down.dims[1] != HIDDEN_SIZE ||
+  src\brain_runtime_timed.c:1451:            !tensor_matvec(&g, &down, ffn, proj)) goto tensor_error;
+  src\brain_runtime_timed.c:1452:        for (int i = 0; i < HIDDEN_SIZE; ++i) x[i] += proj[i];
+  src\brain_runtime_timed.c:1453:        if ((layer + 1) % 4 == 0) fprintf(stderr, "Completed layer %d/%d\n", layer + 1, LAYERS);
+  src\brain_runtime_timed.c:1454:#undef MAT
+  src\brain_runtime_timed.c:1455:    }
+  src\brain_runtime_timed.c:1456:
+  src\brain_runtime_timed.c:1457:    if (!vector_named(&g, "output_norm.weight", norm, HIDDEN_SIZE)) goto tensor_error;
+  src\brain_runtime_timed.c:1458:    rms_norm(x, norm, proj, HIDDEN_SIZE, RMS_EPS);
+  src\brain_runtime_timed.c:1459:    TensorInfo out;
+  src\brain_runtime_timed.c:1460:    if (!find_tensor(&g, "output.weight", &out) || out.n_dims != 2 ||
+  src\brain_runtime_timed.c:1461:        out.dims[0] != HIDDEN_SIZE || out.dims[1] > SIZE_MAX / sizeof(float)) goto tensor_error;
+  src\brain_runtime_timed.c:1462:    logits = malloc((size_t)out.dims[1] * sizeof(float));
+  src\brain_runtime_timed.c:1463:    if (!logits || !tensor_matvec(&g, &out, proj, logits)) goto tensor_error;
+  src\brain_runtime_timed.c:1464:    {
+  src\brain_runtime_timed.c:1465:        uint64_t best[5] = {0};
+  src\brain_runtime_timed.c:1466:        for (int j = 0; j < 5; ++j) best[j] = UINT64_MAX;
+  src\brain_runtime_timed.c:1467:        for (uint64_t i = 0; i < out.dims[1]; ++i) {
+  src\brain_runtime_timed.c:1468:            for (int j = 0; j < 5; ++j) {
+  src\brain_runtime_timed.c:1469:                if (best[j] == UINT64_MAX || logits[i] > logits[best[j]]) {
+  src\brain_runtime_timed.c:1470:                    for (int z = 4; z > j; --z) best[z] = best[z - 1];
+  src\brain_runtime_timed.c:1471:                    best[j] = i; break;
+  src\brain_runtime_timed.c:1472:                }
+  src\brain_runtime_timed.c:1473:            }
+  src\brain_runtime_timed.c:1474:        }
+  src\brain_runtime_timed.c:1475:        printf("Top token scores for input token %llu:\n", token);
+  src\brain_runtime_timed.c:1476:        for (int j = 0; j < 5; ++j)
+  src\brain_runtime_timed.c:1477:            printf("%d: token_id=%llu logit=%g\n", j + 1,
+  src\brain_runtime_timed.c:1478:                   (unsigned long long)best[j], logits[best[j]]);
+  src\brain_runtime_timed.c:1479:    }
+  src\brain_runtime_timed.c:1480:    ok = 1;
+  src\brain_runtime_timed.c:1481:    goto done;
+  src\brain_runtime_timed.c:1482:
+  src\brain_runtime_timed.c:1483:tensor_error:
+> src\brain_runtime_timed.c:1484:    fprintf(stderr, "Inference failed: missing, incompatible, or unreadable tensor\n");
+  src\brain_runtime_timed.c:1485:done:
+  src\brain_runtime_timed.c:1486:    free(x); free(norm); free(q); free(k); free(v); free(att); free(proj);
+  src\brain_runtime_timed.c:1487:    free(gate); free(up); free(ffn); free(logits);
+  src\brain_runtime_timed.c:1488:    gguf_close(&g);
+  src\brain_runtime_timed.c:1489:    ram_model_free();
+  src\brain_runtime_timed.c:1490:    return ok ? 0 : 1;
+  src\brain_runtime_timed.c:1491:}
+  src\brain_runtime_timed.c:1492:#endif
+  src\brain_runtime_timed.c:1493:
+  src\brain_runtime_timed.c:1494:#if defined(ATLAS_COMPACT)
+  src\brain_runtime_timed.c:1495:enum { FFN_SIZE = 4864, LAYERS = 24, MAX_CONTEXT = 2048 };
+  src\brain_runtime_timed.c:1496:#else
+  src\brain_runtime_timed.c:1497:enum { FFN_SIZE = 8960, LAYERS = 28, MAX_CONTEXT = 2048 };
+  src\brain_runtime_timed.c:1498:#endif
+  src\brain_runtime_timed.c:1499:typedef struct {
+  src\brain_runtime_timed.c:1500:    float *x, *norm, *q, *k, *v, *att, *proj, *gate, *up, *ffn, *bias;
+  src\brain_runtime_timed.c:1501:    float *scores, *weights;
+  src\brain_runtime_timed.c:1502:} Work;
+  src\brain_runtime_timed.c:1503:
+  src\brain_runtime_timed.c:1504:static int forward_token(GGUFFile *g, uint32_t token, size_t pos,
+  src\brain_runtime_timed.c:1505:                         float *kc, float *vc, Work *w, float *logits,
+  src\brain_runtime_timed.c:1506:                         uint64_t vocab, int want_logits)
+  src\brain_runtime_timed.c:1507:{
+  src\brain_runtime_timed.c:1508:    TensorInfo emb;
+  src\brain_runtime_timed.c:1509:    if (!find_tensor(g, "token_embd.weight", &emb) || token >= emb.dims[1] ||
+  src\brain_runtime_timed.c:1510:        !load_embedding_row(g, &emb, token, w->x)) return 0;
+  src\brain_runtime_timed.c:1511:    for (int layer = 0; layer < LAYERS; ++layer) {
+  src\brain_runtime_timed.c:1512:        char name[96];
+  src\brain_runtime_timed.c:1513:        snprintf(name, sizeof(name), "blk.%d.attn_norm.weight", layer);
+  src\brain_runtime_timed.c:1514:        if (!vector_named(g, name, w->norm, HIDDEN_SIZE)) return 0;
+  src\brain_runtime_timed.c:1515:        rms_norm(w->x, w->norm, w->proj, HIDDEN_SIZE, RMS_EPS);
+  src\brain_runtime_timed.c:1516:        char q_name[96],k_name[96],v_name[96];
+  src\brain_runtime_timed.c:1517:        snprintf(q_name,sizeof(q_name),"blk.%d.attn_q.weight",layer);
+  src\brain_runtime_timed.c:1518:        snprintf(k_name,sizeof(k_name),"blk.%d.attn_k.weight",layer);
+  src\brain_runtime_timed.c:1519:        snprintf(v_name,sizeof(v_name),"blk.%d.attn_v.weight",layer);
+  src\brain_runtime_timed.c:1520:        const char *qkv_names[3]={q_name,k_name,v_name};
+  src\brain_runtime_timed.c:1521:        float *qkv_outputs[3]={w->q,w->k,w->v};
+  src\brain_runtime_timed.c:1522:        if (!tensor_matvec_batch(g,qkv_names,qkv_outputs,3,w->proj)) return 0;
+  src\brain_runtime_timed.c:1523:        snprintf(name, sizeof(name), "blk.%d.attn_q.bias", layer);
+  src\brain_runtime_timed.c:1524:        if (!vector_named(g, name, w->bias, Q_DIM)) return 0;
+  src\brain_runtime_timed.c:1525:        add_bias(w->q, w->bias, Q_DIM);
+  src\brain_runtime_timed.c:1526:        snprintf(name, sizeof(name), "blk.%d.attn_k.bias", layer);
+  src\brain_runtime_timed.c:1527:        if (!vector_named(g, name, w->bias, KV_DIM)) return 0;
+  src\brain_runtime_timed.c:1528:        add_bias(w->k, w->bias, KV_DIM);
+  src\brain_runtime_timed.c:1529:        snprintf(name, sizeof(name), "blk.%d.attn_v.bias", layer);
+  src\brain_runtime_timed.c:1530:        if (!vector_named(g, name, w->bias, KV_DIM)) return 0;
+  src\brain_runtime_timed.c:1531:        add_bias(w->v, w->bias, KV_DIM);
+  src\brain_runtime_timed.c:1532:        rope(w->q, w->k, Q_DIM, KV_DIM, (int)pos);
+  src\brain_runtime_timed.c:1533:        if (!gqa_single_token(w->q, w->k, w->v, w->att, kc, vc,
+  src\brain_runtime_timed.c:1534:                              (size_t)layer, pos, MAX_CONTEXT,
+  src\brain_runtime_timed.c:1535:                              w->scores, w->weights)) return 0;
+  src\brain_runtime_timed.c:1536:        snprintf(name, sizeof(name), "blk.%d.attn_output.weight", layer);
+  src\brain_runtime_timed.c:1537:        TensorInfo ao;
+  src\brain_runtime_timed.c:1538:        if (!find_tensor(g, name, &ao) || !tensor_matvec(g, &ao, w->att, w->proj)) return 0;
+  src\brain_runtime_timed.c:1539:        for (int i = 0; i < HIDDEN_SIZE; ++i) w->x[i] += w->proj[i];
+  src\brain_runtime_timed.c:1540:        snprintf(name, sizeof(name), "blk.%d.ffn_norm.weight", layer);
+  src\brain_runtime_timed.c:1541:        if (!vector_named(g, name, w->norm, HIDDEN_SIZE)) return 0;
+  src\brain_runtime_timed.c:1542:        rms_norm(w->x, w->norm, w->proj, HIDDEN_SIZE, RMS_EPS);
+  src\brain_runtime_timed.c:1543:        char gate_name[96],up_name[96];
+  src\brain_runtime_timed.c:1544:        snprintf(gate_name,sizeof(gate_name),"blk.%d.ffn_gate.weight",layer);
+  src\brain_runtime_timed.c:1545:        snprintf(up_name,sizeof(up_name),"blk.%d.ffn_up.weight",layer);
+  src\brain_runtime_timed.c:1546:        const char *ffn_names[2]={gate_name,up_name};
+  src\brain_runtime_timed.c:1547:        float *ffn_outputs[2]={w->gate,w->up};
+  src\brain_runtime_timed.c:1548:        if (!tensor_matvec_batch(g,ffn_names,ffn_outputs,2,w->proj)) return 0;
+  src\brain_runtime_timed.c:1549:        for (int i = 0; i < FFN_SIZE; ++i) {
+  src\brain_runtime_timed.c:1550:            float z = w->gate[i];
+  src\brain_runtime_timed.c:1551:            w->ffn[i] = (z / (1.0f + expf(-z))) * w->up[i];
+  src\brain_runtime_timed.c:1552:        }
+  src\brain_runtime_timed.c:1553:        snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", layer);
+  src\brain_runtime_timed.c:1554:        TensorInfo down;
+  src\brain_runtime_timed.c:1555:        if (!find_tensor(g, name, &down) || !tensor_matvec(g, &down, w->ffn, w->proj)) return 0;
+  src\brain_runtime_timed.c:1556:        for (int i = 0; i < HIDDEN_SIZE; ++i) w->x[i] += w->proj[i];
+  src\brain_runtime_timed.c:1557:    }
+  src\brain_runtime_timed.c:1558:    if (!vector_named(g, "output_norm.weight", w->norm, HIDDEN_SIZE)) return 0;
+  src\brain_runtime_timed.c:1559:    rms_norm(w->x, w->norm, w->proj, HIDDEN_SIZE, RMS_EPS);
+  src\brain_runtime_timed.c:1560:    if (want_logits) {
+  src\brain_runtime_timed.c:1561:        TensorInfo out;
+  src\brain_runtime_timed.c:1562:        if (!find_tensor(g, "output.weight", &out) || out.dims[1] != vocab ||
+  src\brain_runtime_timed.c:1563:            !tensor_matvec(g, &out, w->proj, logits)) return 0;
+  src\brain_runtime_timed.c:1564:    }
+  src\brain_runtime_timed.c:1780:    float *kc=array_alloc((size_t)LAYERS*MAX_CONTEXT*KV_DIM,sizeof(float));
+  src\brain_runtime_timed.c:1781:    float *vc=array_alloc((size_t)LAYERS*MAX_CONTEXT*KV_DIM,sizeof(float));
+  src\brain_runtime_timed.c:1782:    float *logits=array_alloc((size_t)vocab,sizeof(float));
+  src\brain_runtime_timed.c:1783:    float *active_logits=logits;
+  src\brain_runtime_timed.c:1784:    int ok = 
+w.x&&w.norm&&w.q&&w.k&&w.v&&w.att&&w.proj&&w.gate&&w.up&&w.ffn&&w.bias&&w.scores&&w.weights&&kc&&vc&&logits;
+  src\brain_runtime_timed.c:1785:    if (!ok) fprintf(stderr,"Inference workspace allocation failed\n");
+  src\brain_runtime_timed.c:1786:    double t_prefill = now_ms(); for (size_t i=0; ok && i<prompt_count; ++i) {
+  src\brain_runtime_timed.c:1787:        if(!forward_token(&g,ids[i],i,kc,vc,&w,logits,vocab,i+1==prompt_count)) { ok=0; break; }
+  src\brain_runtime_timed.c:1788:        fprintf(stderr,"Prompt: %zu/%zu tokens\n",i+1,prompt_count);
+  src\brain_runtime_timed.c:1789:    }
+  src\brain_runtime_timed.c:1790:    if (ok) {
+  src\brain_runtime_timed.c:1791:        double prefill_ms = now_ms() - t_prefill; fprintf(stderr, "[time] prefill %.0f ms for %zu 
+tokens (%.1f ms/token)\n", prefill_ms, prompt_count, prefill_ms / (double)prompt_count); double t_gen = now_ms(); LARGE_INTEGER 
+seed_counter; QueryPerformanceCounter(&seed_counter);
+  src\brain_runtime_timed.c:1792:        uint64_t rng=(uint64_t)seed_counter.QuadPart ^ ((uint64_t)GetCurrentProcessId()<<32) ^ 
+GetTickCount64();
+  src\brain_runtime_timed.c:1793:        if(!rng) rng=0x9e3779b97f4a7c15ULL;
+  src\brain_runtime_timed.c:1794:        double confidence_sum=0.0;
+  src\brain_runtime_timed.c:1795:        unsigned confidence_tokens=0;
+  src\brain_runtime_timed.c:1796:        int hit_token_limit=1;
+  src\brain_runtime_timed.c:1797:        for (unsigned step=0; step<gen_n; ++step) {
+  src\brain_runtime_timed.c:1798:            float step_confidence=0.0f;
+  src\brain_runtime_timed.c:1799:            uint32_t next=atlas_sample_token(active_logits,&tok,vocab,
+  src\brain_runtime_timed.c:1800:                ids+prompt_count,step,step>=min_n,min_n==0,&rng,&step_confidence);
+  src\brain_runtime_timed.c:1801:            if (!strcmp(tok.tokens[next],"<|im_end|>") || 
+!strcmp(tok.tokens[next],"<|endoftext|>")) {
+  src\brain_runtime_timed.c:1802:                hit_token_limit=0;
+  src\brain_runtime_timed.c:1803:                break;
+  src\brain_runtime_timed.c:1804:            }
+  src\brain_runtime_timed.c:1805:            confidence_sum+=step_confidence; ++confidence_tokens;
+  src\brain_runtime_timed.c:1806:            ids[prompt_count+step]=next;
+  src\brain_runtime_timed.c:1807:            decode_token(&tok,next,stdout); fflush(stdout);
+  src\brain_runtime_timed.c:1808:            if(step+1<gen_n && !forward_token(&g,next,prompt_count+step,kc,vc,&w,logits,vocab,1)) { 
+ok=0; break; }
+  src\brain_runtime_timed.c:1809:        }
+  src\brain_runtime_timed.c:1810:        fputc('\n',stdout); fflush(stdout);
+  src\brain_runtime_timed.c:1811:        double gen_ms = now_ms() - t_gen; if (confidence_tokens && gen_ms > 0) fprintf(stderr, 
+"[time] generation %.1f tokens/s (%u tokens)\n", confidence_tokens * 1000.0 / gen_ms, confidence_tokens); if(ok && emit_confidence) {
+  src\brain_runtime_timed.c:1812:            float answer_confidence=confidence_tokens
+  src\brain_runtime_timed.c:1813:                ?(float)(confidence_sum/confidence_tokens):0.0f;
+  src\brain_runtime_timed.c:1814:            answer_confidence*=request_difficulty_factor(argv[2]);
+  src\brain_runtime_timed.c:1815:            if(hit_token_limit) answer_confidence*=0.50f;
+  src\brain_runtime_timed.c:1816:            fprintf(stdout,"\036ATLAS_CONFIDENCE=%.4f,TRUNCATED=%d\036\n",
+  src\brain_runtime_timed.c:1817:                    answer_confidence,hit_token_limit);
+  src\brain_runtime_timed.c:1818:        }
+  src\brain_runtime_timed.c:1819:    }
+> src\brain_runtime_timed.c:1820:    if (!ok) fprintf(stderr,"Inference failed: incompatible tensor or model data\n");
+  src\brain_runtime_timed.c:1821:    free(ids); free(w.x); free(w.norm); free(w.q); free(w.k); free(w.v); free(w.att); free(w.proj);
+  src\brain_runtime_timed.c:1822:    free(w.gate); free(w.up); free(w.ffn); free(w.bias); free(w.scores); free(w.weights); free(kc); 
+free(vc); free(logits);
+  src\brain_runtime_timed.c:1823:    tokenizer_free(&tok);gguf_close(&g);brain_gpu_shutdown();ram_model_free();
+  src\brain_runtime_timed.c:1824:    return ok?0:1;
+  src\brain_runtime_timed.c:1825:}
+  src\brain_runtime_timed.c:1826:
+  src\brain_runtime_timed.c:1827:int wmain(int argc, wchar_t **wargv)
+  src\brain_runtime_timed.c:1828:{
+  src\brain_runtime_timed.c:1829:    char **argv = calloc((size_t)argc, sizeof(char *));
+  src\brain_runtime_timed.c:1830:    if (!argv) return 1;
+  src\brain_runtime_timed.c:1831:    for (int i = 0; i < argc; ++i) {
+  src\brain_runtime_timed.c:1832:        int n = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, NULL, 0, NULL, NULL);
+  src\brain_runtime_timed.c:1833:        if (n <= 0 || !(argv[i] = malloc((size_t)n)) ||
+  src\brain_runtime_timed.c:1834:            !WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, argv[i], n, NULL, NULL)) {
+  src\brain_runtime_timed.c:1835:            for (int j = 0; j <= i; ++j) free(argv[j]);
+  src\brain_runtime_timed.c:1836:            free(argv); return 1;
+  src\brain_runtime_timed.c:1837:        }
+  src\brain_runtime_timed.c:1838:    }
+  src\brain_runtime_timed.c:1839:    int result = run_main_utf8(argc, argv);
+  src\brain_runtime_timed.c:1840:    for (int i = 0; i < argc; ++i) free(argv[i]);
+  src\brain_runtime_timed.c:1841:    free(argv);
+  src\brain_runtime_timed.c:1842:    return result;
+  src\brain_runtime_timed.c:1843:}
+  src\brain_runtime_timed.c:1844:#define LAYERS 24
+  src\brain_runtime_timed.c:1845:#define FFN_SIZE 4096
+  src\brain_runtime_timed.c:1846:
+  src\brain_runtime_timed.c:1847:
+  src\brain_runtime_timed.c:1848:
+  src\chat_gui.c:520:    if (from_reference) {
+  src\chat_gui.c:521:        post_status(req,L"Using a saved Atlas reference",0);
+  src\chat_gui.c:522:        wchar_t *part=utf8_to_wide(response);
+  src\chat_gui.c:523:        if (part && !PostMessageW(req->window,WM_APPEND_TEXT,0,(LPARAM)part)) free(part);
+  src\chat_gui.c:524:    }
+  src\chat_gui.c:525:    if (!response) {
+  src\chat_gui.c:526:    post_status(req,L"Starting Atlas's local model",0);
+  src\chat_gui.c:527:#if defined(ATLAS_COMPACT)
+  src\chat_gui.c:528:    snprintf(command,n*2+512,INFER_EXE " %s %s %u %u 
+--confidence",qmodel,qprompt,req->max_tokens,req->min_tokens);
+  src\chat_gui.c:529:#else
+  src\chat_gui.c:530:    quote_arg(qlanguage, n, language_model);
+  src\chat_gui.c:531:    quote_arg(qteacher,n,teacher_model);
+  src\chat_gui.c:532:    snprintf(command,n*2+512,INFER_EXE " %s %s %u %u %s 
+--confidence",qmodel,qprompt,req->max_tokens,req->min_tokens,qlanguage);
+  src\chat_gui.c:533:#endif
+  src\chat_gui.c:534:    response=run_child_capture(req,command,&exit_code);
+  src\chat_gui.c:535:    float confidence=remove_confidence_marker(response,NULL);
+  src\chat_gui.c:536:#if !defined(ATLAS_COMPACT)
+  src\chat_gui.c:537:    if (exit_code==0 && confidence>=0.0f && confidence<0.25f) {
+  src\chat_gui.c:538:        InterlockedExchange(&req->stage,1);
+  src\chat_gui.c:539:        post_status(req,L"Consulting Atlas's 1.5B reference",0);
+  src\chat_gui.c:540:        wchar_t *notice=utf8_to_wide("\r\n[Low confidence; checking Atlas's 1.5B reference model...]\r\n");
+  src\chat_gui.c:541:        if (notice && !PostMessageW(req->window,WM_APPEND_TEXT,0,(LPARAM)notice)) free(notice);
+  src\chat_gui.c:542:        snprintf(command,n*2+512,"atlas_teacher_infer.exe %s %s %u %u --confidence",
+  src\chat_gui.c:543:                 qteacher,qprompt,req->max_tokens,req->min_tokens);
+  src\chat_gui.c:544:        DWORD teacher_exit=1;
+  src\chat_gui.c:545:        char *teacher=run_child_capture(req,command,&teacher_exit);
+  src\chat_gui.c:546:        int teacher_truncated=0;
+  src\chat_gui.c:547:        (void)remove_confidence_marker(teacher,&teacher_truncated);
+  src\chat_gui.c:548:        if (teacher_exit==0 && teacher && *teacher) {
+  src\chat_gui.c:549:            free(response); response=teacher;
+  src\chat_gui.c:550:            if (!teacher_truncated) save_reference(question_key,response);
+  src\chat_gui.c:551:        } else free(teacher);
+  src\chat_gui.c:552:    }
+  src\chat_gui.c:553:#endif
+  src\chat_gui.c:554:    }
+  src\chat_gui.c:555:    if (response && !from_reference) {
+  src\chat_gui.c:556:        wchar_t *part=utf8_to_wide(response);
+  src\chat_gui.c:557:        if (part && !PostMessageW(req->window,WM_APPEND_TEXT,0,(LPARAM)part)) free(part);
+  src\chat_gui.c:558:    }
+  src\chat_gui.c:559:    if (exit_code!=0 && exit_code!=124 && response) {
+> src\chat_gui.c:560:        size_t a=strlen(response),b=strlen("\r\n[Inference failed.]\r\n");
+  src\chat_gui.c:561:        char *grown=realloc(response,a+b+1);
+> src\chat_gui.c:562:        if (grown) { response=grown; memcpy(response+a,"\r\n[Inference failed.]\r\n",b+1); }
+  src\chat_gui.c:563:    }
+  src\chat_gui.c:564:    free(model); free(qmodel); free(qprompt); free(command);
+  src\chat_gui.c:565:#if !defined(ATLAS_COMPACT)
+  src\chat_gui.c:566:    free(language_model); free(teacher_model); free(qlanguage); free(qteacher);
+  src\chat_gui.c:567:#endif
+  src\chat_gui.c:568:    free(question);
+  src\chat_gui.c:569:    free(question_key);
+  src\chat_gui.c:570:    {
+  src\chat_gui.c:571:        Response *result = calloc(1, sizeof(*result));
+  src\chat_gui.c:572:        if (result) {
+  src\chat_gui.c:573:            result->context = req->prompt_utf8;
+  src\chat_gui.c:574:            result->text = response ? response : _strdup("\r\n[Could not allocate inference output.]\r\n");
+  src\chat_gui.c:575:            PostMessageW(req->window, WM_REQUEST_DONE, 0, (LPARAM)result);
+  src\chat_gui.c:576:        } else { free(response); free(req->prompt_utf8); PostMessageW(req->window, WM_REQUEST_DONE, 0, 0); }
+  src\chat_gui.c:577:        free(req);
+  src\chat_gui.c:578:    }
+  src\chat_gui.c:579:    return 0;
+  src\chat_gui.c:580:failed:
+  src\chat_gui.c:581:    free(model); free(qmodel); free(qprompt); free(command);
+  src\chat_gui.c:582:#if !defined(ATLAS_COMPACT)
+  src\chat_gui.c:583:    free(language_model); free(teacher_model); free(qlanguage); free(qteacher);
+  src\chat_gui.c:584:#endif
+  src\chat_gui.c:585:    free(question);
+  src\chat_gui.c:586:    free(question_key);
+  src\chat_gui.c:587:    {
+  src\chat_gui.c:588:        Response *result = calloc(1, sizeof(*result));
+  src\chat_gui.c:589:        if (result) {
+  src\chat_gui.c:590:            result->context = req->prompt_utf8;
+  src\chat_gui.c:591:            result->text = _strdup("\r\n[Could not launch inference worker.]\r\n");
+  src\chat_gui.c:592:            PostMessageW(req->window, WM_REQUEST_DONE, 0, (LPARAM)result);
+  src\chat_gui.c:593:        } else { free(req->prompt_utf8); PostMessageW(req->window, WM_REQUEST_DONE, 0, 0); }
+  src\chat_gui.c:594:        free(req);
+  src\chat_gui.c:595:    }
+  src\chat_gui.c:596:    return 1;
+  src\chat_gui.c:597:}
+  src\chat_gui.c:598:
+  src\chat_gui.c:599:static void start_request(HWND window)
+  src\chat_gui.c:600:{
+  src\chat_gui.c:601:    int chars = GetWindowTextLengthW(prompt_edit);
+  src\chat_gui.c:602:    if (chars <= 0) { MessageBoxW(window, L"Type a message first.", L"Empty message", MB_OK | 
+MB_ICONINFORMATION); return; }
+  src\chat_gui.c:603:    wchar_t *wide = malloc(((size_t)chars + 1) * sizeof(wchar_t));
+  src\chat_gui.c:604:    if (!wide) return;
+  src\chat_gui.c:605:    GetWindowTextW(prompt_edit, wide, chars + 1);
+  src\chat_gui.c:606:    char *message = wide_to_utf8(wide); free(wide);
+  src\chat_gui.c:607:    if (!message) return;
+  src\chat_gui.c:608:    size_t oldlen = conversation ? strlen(conversation) : 0;
+  src\chat_gui.c:609:    size_t newlen = oldlen + strlen(message) + 100;
+  src\chat_gui.c:610:    char *utf8 = malloc(newlen);
+  src\chat_gui.c:611:    if (!utf8) { free(message); return; }
+  src\chat_gui.c:612:    if (oldlen) memcpy(utf8, conversation, oldlen); else utf8[0] = 0;
+  src\chat_gui.c:613:    snprintf(utf8 + oldlen, newlen - oldlen,
+  src\chat_gui.c:614:             "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", message);
+  src\chat_gui.c:615:    wchar_t *echo = utf8_to_wide(message);
+  src\chat_gui.c:616:    append_wide(L"\r\nYou: "); if (echo) { append_wide(echo); free(echo); }
+  src\chat_gui.c:617:#if defined(ATLAS_COMPACT)
+  src\chat_gui.c:618:    append_wide(L"\r\nAtlas LLM 1.0 (Coder 100%): ");
+  src\chat_gui.c:619:#else
+  src\chat_gui.c:620:    append_wide(message_needs_code_model(message)
+  src\chat_gui.c:621:        ? L"\r\nAtlas LLM 1.0 (Coder 100%, Language 0%): "
+  src\chat_gui.c:622:        : L"\r\nAtlas LLM 1.0 (Language 100%, Coder 0%): ");
+  src\chat_gui.c:623:#endif
+  src\chat_gui.c:624:    append_wide(L"\r\n");
+  src\chat_gui.c:625:    SetWindowTextW(prompt_edit, L"");
+  src\chat_gui.c:626:    EnableWindow(send_button, FALSE);
+  src\chat_gui.c:627:    SetWindowTextW(status_label,L"Starting Atlas's local model...");
+  src\chat_gui.c:628:    Request *req = malloc(sizeof(*req));
+  src\chat_gui.c:629:    if (!req) { free(utf8); EnableWindow(send_button, TRUE); return; }
+  src\chat_gui.c:630:    req->window = window; req->prompt_utf8 = utf8;
+  src\chat_gui.c:631:    req->deadline_tick=GetTickCount64()+300000ULL;
+  src\chat_gui.c:632:    req->stage=0;
+  src\chat_gui.c:633:    req->min_tokens=message_needs_code_model(message) ? 0 : min_reply_tokens(message);
+  src\chat_gui.c:634:    req->max_tokens=message_needs_code_model(message) || message_needs_decomposition(message)
+  src\chat_gui.c:635:        ? 512 : (req->min_tokens ? 256 : 128);
+  src\chat_gui.c:636:    free(message);
+  src\chat_gui.c:637:    char *pending=_strdup(utf8);
+  src\chat_gui.c:638:    if (pending) { free(conversation); conversation=pending; save_memory(); }
+  src\chat_gui.c:639:    HANDLE thread = CreateThread(NULL, 0, inference_worker, req, 0, NULL);
+  src\chat_gui.c:640:    if (!thread) { free(utf8); free(req); EnableWindow(send_button, TRUE); append_wide(L"Could not start 
+inference worker.\r\n"); }
+  src\chat_gui.c:641:    else CloseHandle(thread);
+  src\chat_gui.c:642:}
+  src\chat_gui.c:665:                            DEFAULT_PITCH|FF_DONTCARE,L"Segoe UI");
+  src\chat_gui.c:666:        apply_ui_font(search_edit); apply_ui_font(prompt_edit); apply_ui_font(output_box);
+  src\chat_gui.c:667:        apply_ui_font(status_label);
+  src\chat_gui.c:668:        HWND find_button=GetDlgItem(window,ID_FIND); apply_ui_font(find_button);
+  src\chat_gui.c:669:        apply_ui_font(send_button);
+  src\chat_gui.c:670:        if (conversation_restored) render_saved_conversation();
+  src\chat_gui.c:671:        return 0;
+  src\chat_gui.c:672:    case WM_SIZE:
+  src\chat_gui.c:673:        if (output_box) {
+  src\chat_gui.c:674:            int w = LOWORD(lp), h = HIWORD(lp);
+  src\chat_gui.c:675:            MoveWindow(search_edit,108,12,w-220,28,TRUE);
+  src\chat_gui.c:676:            MoveWindow(GetDlgItem(window,ID_FIND),w-100,10,84,32,TRUE);
+  src\chat_gui.c:677:            MoveWindow(prompt_edit,16,48,w-148,82,TRUE);
+  src\chat_gui.c:678:            MoveWindow(send_button,w-116,48,100,36,TRUE);
+  src\chat_gui.c:679:            MoveWindow(status_label,16,136,w-32,24,TRUE);
+  src\chat_gui.c:680:            MoveWindow(output_box,16,166,w-32,h-182,TRUE);
+  src\chat_gui.c:681:        }
+  src\chat_gui.c:682:        return 0;
+  src\chat_gui.c:683:    case WM_COMMAND:
+  src\chat_gui.c:684:        if (LOWORD(wp) == ID_SEND) { start_request(window); return 0; }
+  src\chat_gui.c:685:        if (LOWORD(wp) == ID_FIND) { find_in_chat(window); return 0; }
+  src\chat_gui.c:686:        if (LOWORD(wp)==ID_SEARCH && HIWORD(wp)==EN_SETFOCUS) return 0;
+  src\chat_gui.c:687:        break;
+  src\chat_gui.c:688:    case WM_KEYDOWN:
+  src\chat_gui.c:689:        if (wp=='F' && (GetKeyState(VK_CONTROL)&0x8000)) { SetFocus(search_edit); return 0; }
+  src\chat_gui.c:690:        break;
+  src\chat_gui.c:691:    case WM_INFERENCE_PROGRESS: {
+  src\chat_gui.c:692:        wchar_t *status=(wchar_t*)lp;
+  src\chat_gui.c:693:        if (status) { SetWindowTextW(status_label,status); free(status); }
+  src\chat_gui.c:694:        return 0;
+  src\chat_gui.c:695:    }
+  src\chat_gui.c:696:    case WM_APPEND_TEXT: {
+  src\chat_gui.c:697:        wchar_t *wide = (wchar_t *)lp;
+  src\chat_gui.c:698:        if (wide) { append_wide(wide); free(wide); }
+  src\chat_gui.c:699:        return 0;
+  src\chat_gui.c:700:    }
+  src\chat_gui.c:701:    case WM_REQUEST_DONE: {
+  src\chat_gui.c:702:        Response *result = (Response *)lp;
+  src\chat_gui.c:703:        if (result) {
+  src\chat_gui.c:704:            const char *message=result->text ? result->text : "";
+> src\chat_gui.c:705:            const char *error=strstr(message,"[Inference failed.");
+  src\chat_gui.c:706:            if (!error) error=strstr(message,"Could not start " INFER_EXE);
+  src\chat_gui.c:707:            if (!error) error=strstr(message,"Could not launch inference worker.");
+  src\chat_gui.c:708:            if (error) {
+  src\chat_gui.c:709:                wchar_t *notice=utf8_to_wide(error);
+  src\chat_gui.c:710:                if (notice) { append_wide(notice); free(notice); }
+  src\chat_gui.c:711:            }
+  src\chat_gui.c:712:            size_t a = strlen(result->context ? result->context : "");
+  src\chat_gui.c:713:            size_t b = strlen(result->text ? result->text : "");
+  src\chat_gui.c:714:            static const char turn_end[] = "<|im_end|>\n";
+  src\chat_gui.c:715:            char *next = malloc(a + b + sizeof(turn_end));
+  src\chat_gui.c:716:            if (next) {
+  src\chat_gui.c:717:                memcpy(next, result->context, a);
+  src\chat_gui.c:718:                memcpy(next + a, result->text, b);
+  src\chat_gui.c:719:                memcpy(next + a + b, turn_end, sizeof(turn_end));
+  src\chat_gui.c:720:                free(conversation); conversation = next;
+  src\chat_gui.c:721:                size_t len = strlen(conversation);
+  src\chat_gui.c:722:                if (len > 10000) {
+  src\chat_gui.c:723:                    const char *cut = conversation + len - 7000;
+  src\chat_gui.c:724:                    const char *boundary = strstr(cut, "<|im_start|>user\n");
+  src\chat_gui.c:725:                    if (boundary) {
+  src\chat_gui.c:726:                        const char *system = system_message;
+  src\chat_gui.c:727:                        size_t prefix = strlen(system);
+  src\chat_gui.c:728:                        size_t tail = strlen(boundary);
+  src\chat_gui.c:729:                        char *trimmed = malloc(prefix + tail + 1);
+  src\chat_gui.c:730:                        if (trimmed) { memcpy(trimmed, system, prefix); memcpy(trimmed + prefix, boundary, tail 
++ 1); free(conversation); conversation = trimmed; }
+  src\chat_gui.c:731:                    }
+  src\chat_gui.c:732:                }
+  src\chat_gui.c:733:                save_memory();
+  src\chat_gui.c:734:            }
+  src\chat_gui.c:735:            free(result->context); free(result->text); free(result);
+  src\chat_gui.c:736:        }
+  src\chat_gui.c:737:        EnableWindow(send_button, TRUE);
+  src\chat_gui.c:738:        SetWindowTextW(status_label,L"Ready");
+  src\chat_gui.c:739:        return 0;
+  src\chat_gui.c:740:    }
+  src\chat_gui.c:741:    case WM_DESTROY: save_memory(); PostQuitMessage(0); return 0;
+  src\chat_gui.c:742:    case WM_DESTROY + 100: return 0;
+  src\chat_gui.c:743:    }
+  src\chat_gui.c:744:    return DefWindowProcW(window, msg, wp, lp);
+  src\chat_gui.c:745:}
+  src\chat_gui.c:746:
+  src\chat_gui.c:747:int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR cmdline, int show)
+  src\chat_gui.c:748:{
+  src\chat_gui.c:749:    (void)previous; (void)cmdline;
+  src\chat_gui.c:750:    init_memory_path();
+  src\chat_gui.c:751:    conversation=load_memory();
+  src\chat_gui.c:752:    if (conversation) {
+  src\chat_gui.c:753:        const char *old_system_end=strstr(conversation,"<|im_end|>\n");
+  src\chat_gui.c:754:        if (old_system_end && !strncmp(conversation,"<|im_start|>system\n",19)) {
+  src\chat_gui.c:755:            const char *history=old_system_end+sizeof("<|im_end|>\n")-1;
+  src\chat_gui.c:756:            size_t prefix=strlen(system_message), tail=strlen(history);
+  src\chat_gui.c:757:            char *updated=malloc(prefix+tail+1);
+  src\chat_gui.c:758:            if (updated) {
+  src\chat_gui.c:759:                memcpy(updated,system_message,prefix);
+  src\chat_gui.c:760:                memcpy(updated+prefix,history,tail+1);
+  src\chat_gui.c:761:                free(conversation); conversation=updated;
+  src\chat_gui.c:762:                save_memory();
+  src\chat_gui.c:763:            }
+  src\chat_gui.c:764:        }
+  src\chat_gui.c:765:        conversation_restored=1;
+  src\chat_gui.c:766:    } else conversation=_strdup(system_message);
+  src\chat_gui.c:767:    WNDCLASSW wc = {0}; wc.lpfnWndProc = window_proc; wc.hInstance = instance;
+  src\chat_gui.c:768:    wc.lpszClassName = L"AtlasChatWindow"; wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+  src\chat_gui.c:769:    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+  src\chat_gui.c:770:    if (!RegisterClassW(&wc)) return 1;
+  src\chat_gui.c:771:    HWND window = CreateWindowW(wc.lpszClassName, WINDOW_TITLE, WS_OVERLAPPEDWINDOW,
+  src\chat_gui.c:772:        CW_USEDEFAULT, CW_USEDEFAULT, 820, 620, NULL, NULL, instance, NULL);
+  src\chat_gui.c:773:    if (!window) return 1;
+  src\chat_gui.c:774:    ShowWindow(window, show);
+  src\chat_gui.c:775:#if defined(ATLAS_UI_DESIGN_TEST)
+  src\chat_gui.c:776:    ShowWindow(window,SW_HIDE);
+  src\chat_gui.c:777:    SetWindowTextW(prompt_edit,
+  src\chat_gui.c:778:        L"Atlas, design a better user interface for yourself. Break the interface proposal into a few small 
+parts and decide which changes give the most usability benefit for the least processing and implementation work. The current app is 
+a native Win32 chat window. Propose a practical prioritized design that improves readability, conversation navigation, composing and 
+sending, response status, and model/reference visibility. Describe the layout, controls, and keyboard behavior. Keep it realistic to 
+implement in plain C Win32, concise enough that we can implement it, and do not write source code yet.");
+  src\chat_gui.c:779:    PostMessageW(window,WM_COMMAND,ID_SEND,0);
+  src\chat_gui.c:780:#endif
+  src\chat_gui.c:781:    MSG msg; while (GetMessageW(&msg, NULL, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+  src\chat_gui.c:782:    return (int)msg.wParam;
+  src\chat_gui.c:783:}
+
+

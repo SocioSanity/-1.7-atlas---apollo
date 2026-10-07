@@ -1,0 +1,1 @@
+A linked list is a linear data structure that consists of a series of nodes, each containing a value and a reference to the next node in the sequence.

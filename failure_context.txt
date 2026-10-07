@@ -1,0 +1,81 @@
+    }
+
+    if (!vector_named(&g, "output_norm.weight", norm, HIDDEN_SIZE)) goto tensor_error;
+    rms_norm(x, norm, proj, HIDDEN_SIZE, RMS_EPS);
+    TensorInfo out;
+    if (!find_tensor(&g, "output.weight", &out) || out.n_dims != 2 ||
+        out.dims[0] != HIDDEN_SIZE || out.dims[1] > SIZE_MAX / sizeof(float)) goto tensor_error;
+    logits = malloc((size_t)out.dims[1] * sizeof(float));
+    if (!logits || !tensor_matvec(&g, &out, proj, logits)) goto tensor_error;
+    {
+        uint64_t best[5] = {0};
+        for (int j = 0; j < 5; ++j) best[j] = UINT64_MAX;
+        for (uint64_t i = 0; i < out.dims[1]; ++i) {
+            for (int j = 0; j < 5; ++j) {
+                if (best[j] == UINT64_MAX || logits[i] > logits[best[j]]) {
+                    for (int z = 4; z > j; --z) best[z] = best[z - 1];
+                    best[j] = i; break;
+                }
+            }
+        }
+        printf("Top token scores for input token %llu:\n", token);
+        for (int j = 0; j < 5; ++j)
+            printf("%d: token_id=%llu logit=%g\n", j + 1,
+                   (unsigned long long)best[j], logits[best[j]]);
+    }
+    ok = 1;
+    goto done;
+
+tensor_error:
+    fprintf(stderr, "Inference failed: missing, incompatible, or unreadable tensor\n");
+done:
+    free(x); free(norm); free(q); free(k); free(v); free(att); free(proj);
+    free(gate); free(up); free(ffn); free(logits);
+    gguf_close(&g);
+    ram_model_free();
+    return ok ? 0 : 1;
+}
+#endif
+
+#if defined(ATLAS_COMPACT)
+enum { FFN_SIZE = 4864, LAYERS = 24, MAX_CONTEXT = 2048 };
+#else
+enum { FFN_SIZE = 8960, LAYERS = 28, MAX_CONTEXT = 2048 };
+#endif
+typedef struct {
+    float *x, *norm, *q, *k, *v, *att, *proj, *gate, *up, *ffn, *bias;
+    float *scores, *weights;
+} Work;
+
+static int forward_token(GGUFFile *g, uint32_t token, size_t pos,
+                         float *kc, float *vc, Work *w, float *logits,
+                         uint64_t vocab, int want_logits)
+{
+    TensorInfo emb;
+    if (!find_tensor(g, "token_embd.weight", &emb) || token >= emb.dims[1] ||
+        !load_embedding_row(g, &emb, token, w->x)) return 0;
+    for (int layer = 0; layer < LAYERS; ++layer) {
+        char name[96];
+        snprintf(name, sizeof(name), "blk.%d.attn_norm.weight", layer);
+        if (!vector_named(g, name, w->norm, HIDDEN_SIZE)) return 0;
+        rms_norm(w->x, w->norm, w->proj, HIDDEN_SIZE, RMS_EPS);
+        char q_name[96],k_name[96],v_name[96];
+        snprintf(q_name,sizeof(q_name),"blk.%d.attn_q.weight",layer);
+        snprintf(k_name,sizeof(k_name),"blk.%d.attn_k.weight",layer);
+        snprintf(v_name,sizeof(v_name),"blk.%d.attn_v.weight",layer);
+        const char *qkv_names[3]={q_name,k_name,v_name};
+        float *qkv_outputs[3]={w->q,w->k,w->v};
+        if (!tensor_matvec_batch(g,qkv_names,qkv_outputs,3,w->proj)) return 0;
+        snprintf(name, sizeof(name), "blk.%d.attn_q.bias", layer);
+        if (!vector_named(g, name, w->bias, Q_DIM)) return 0;
+        add_bias(w->q, w->bias, Q_DIM);
+        snprintf(name, sizeof(name), "blk.%d.attn_k.bias", layer);
+        if (!vector_named(g, name, w->bias, KV_DIM)) return 0;
+        add_bias(w->k, w->bias, KV_DIM);
+        snprintf(name, sizeof(name), "blk.%d.attn_v.bias", layer);
+        if (!vector_named(g, name, w->bias, KV_DIM)) return 0;
+        add_bias(w->v, w->bias, KV_DIM);
+        rope(w->q, w->k, Q_DIM, KV_DIM, (int)pos);
+        if (!gqa_single_token(w->q, w->k, w->v, w->att, kc, vc,
+                              (size_t)layer, pos, MAX_CONTEXT,
+                              w->scores, w->weights)) return 0;

@@ -1,0 +1,5 @@
+model\specialists\qwen\qwen2.5-coder-0.5b-q5_k_m.gguf	4	1
+model\atlas-llm-1.0-compact.gguf	2	1
+model\atlas-llm-1.0-language.gguf	1	0
+model\specialists\qwen\qwen2.5-1.5b-instruct-q4_k_m.gguf	1	1
+model\specialists\qwen\qwen2.5-coder-1.5b-q4_k_m.gguf	1	1

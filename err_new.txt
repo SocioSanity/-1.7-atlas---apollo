@@ -1,0 +1,20 @@
+.\brain_runtime_batch.exe : Model loaded into RAM: 468.64 MB
+At line:1 char:1
++ .\brain_runtime_batch.exe $model $prompt 8 > out_new.txt 2> err_new.t ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Model loaded into RAM: 468.64 MB:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+Inference data source: RAM
+Inference device: CPU fallback
+Atlas using the single-model profile
+[time] startup 348 ms (model load + device init + gguf/tokenizer)
+Prompt: 32/216 tokens
+Prompt: 64/216 tokens
+Prompt: 96/216 tokens
+Prompt: 128/216 tokens
+Prompt: 160/216 tokens
+Prompt: 192/216 tokens
+Prompt: 216/216 tokens
+[time] prefill 1963 ms for 216 tokens (9.1 ms/token)
+[time] generation 17.9 tokens/s (8 tokens)

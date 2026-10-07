@@ -1,0 +1,26 @@
+Model loaded into RAM: 1065.56 MB
+Inference data source: RAM
+Inference device: CPU fallback
+Atlas using the single-model profile
+[time] startup 523 ms (model load + device init + gguf/tokenizer)
+Prompt: 1/19 tokens
+Prompt: 2/19 tokens
+Prompt: 3/19 tokens
+Prompt: 4/19 tokens
+Prompt: 5/19 tokens
+Prompt: 6/19 tokens
+Prompt: 7/19 tokens
+Prompt: 8/19 tokens
+Prompt: 9/19 tokens
+Prompt: 10/19 tokens
+Prompt: 11/19 tokens
+Prompt: 12/19 tokens
+Prompt: 13/19 tokens
+Prompt: 14/19 tokens
+Prompt: 15/19 tokens
+Prompt: 16/19 tokens
+Prompt: 17/19 tokens
+Prompt: 18/19 tokens
+Prompt: 19/19 tokens
+[time] prefill 1355 ms for 19 tokens (71.3 ms/token)
+[time] generation 9.0 tokens/s (31 tokens)
