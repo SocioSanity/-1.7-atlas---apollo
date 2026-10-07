@@ -1,0 +1,292 @@
+#include <stdio.h>
+#include <stdint.h>
+#include <inttypes.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int read_u32(FILE *f, uint32_t *v)
+{
+    return fread(v, sizeof(*v), 1, f) == 1;
+}
+
+static int read_u64(FILE *f, uint64_t *v)
+{
+    return fread(v, sizeof(*v), 1, f) == 1;
+}
+
+static int read_string(FILE *f, char **out)
+{
+    uint64_t len;
+
+    if (!read_u64(f, &len))
+        return 0;
+
+    if (len > SIZE_MAX - 1)
+        return 0;
+
+    char *s = malloc((size_t)len + 1);
+    if (!s)
+        return 0;
+
+    if (len && fread(s, 1, (size_t)len, f) != len) {
+        free(s);
+        return 0;
+    }
+
+    s[len] = '\0';
+    *out = s;
+    return 1;
+}
+
+static int skip_string(FILE *f)
+{
+    uint64_t len;
+
+    if (!read_u64(f, &len))
+        return 0;
+
+    return _fseeki64(f, (__int64)len, SEEK_CUR) == 0;
+}
+
+static int skip_value(FILE *f, uint32_t type);
+
+static int skip_array(FILE *f)
+{
+    uint32_t elem_type;
+    uint64_t count;
+
+    if (!read_u32(f, &elem_type))
+        return 0;
+
+    if (!read_u64(f, &count))
+        return 0;
+
+    for (uint64_t i = 0; i < count; ++i) {
+        if (!skip_value(f, elem_type))
+            return 0;
+    }
+
+    return 1;
+}
+
+static int skip_value(FILE *f, uint32_t type)
+{
+    switch (type) {
+        case 0:
+        case 1:
+        case 7:
+            return _fseeki64(f, 1, SEEK_CUR) == 0;
+
+        case 2:
+        case 3:
+            return _fseeki64(f, 2, SEEK_CUR) == 0;
+
+        case 4:
+        case 5:
+        case 6:
+            return _fseeki64(f, 4, SEEK_CUR) == 0;
+
+        case 8:
+            return skip_string(f);
+
+        case 9:
+            return skip_array(f);
+
+        case 10:
+        case 11:
+        case 12:
+            return _fseeki64(f, 8, SEEK_CUR) == 0;
+
+        default:
+            return 0;
+    }
+}
+
+static int print_metadata_value(FILE *f, uint32_t type)
+{
+    switch (type) {
+        case 4: {
+            uint32_t v;
+            if (!read_u32(f, &v))
+                return 0;
+            printf("%" PRIu32, v);
+            return 1;
+        }
+
+        case 5: {
+            int32_t v;
+            if (fread(&v, sizeof(v), 1, f) != 1)
+                return 0;
+            printf("%" PRId32, v);
+            return 1;
+        }
+
+        case 6: {
+            float v;
+            if (fread(&v, sizeof(v), 1, f) != 1)
+                return 0;
+            printf("%g", (double)v);
+            return 1;
+        }
+
+        case 10: {
+            uint64_t v;
+            if (!read_u64(f, &v))
+                return 0;
+            printf("%" PRIu64, v);
+            return 1;
+        }
+
+        case 11: {
+            int64_t v;
+            if (fread(&v, sizeof(v), 1, f) != 1)
+                return 0;
+            printf("%" PRId64, v);
+            return 1;
+        }
+
+        case 8: {
+            char *s = NULL;
+
+            if (!read_string(f, &s))
+                return 0;
+
+            printf("\"%s\"", s);
+            free(s);
+            return 1;
+        }
+
+        case 7: {
+            uint8_t v;
+
+            if (fread(&v, 1, 1, f) != 1)
+                return 0;
+
+            printf("%s", v ? "true" : "false");
+            return 1;
+        }
+
+        case 0: {
+            uint8_t v;
+            if (fread(&v, 1, 1, f) != 1)
+                return 0;
+            printf("%u", (unsigned)v);
+            return 1;
+        }
+
+        case 1: {
+            int8_t v;
+            if (fread(&v, 1, 1, f) != 1)
+                return 0;
+            printf("%d", (int)v);
+            return 1;
+        }
+
+        case 2: {
+            uint16_t v;
+            if (fread(&v, sizeof(v), 1, f) != 1)
+                return 0;
+            printf("%u", (unsigned)v);
+            return 1;
+        }
+
+        case 3: {
+            int16_t v;
+            if (fread(&v, sizeof(v), 1, f) != 1)
+                return 0;
+            printf("%d", (int)v);
+            return 1;
+        }
+
+        case 12: {
+            double v;
+            if (fread(&v, sizeof(v), 1, f) != 1)
+                return 0;
+            printf("%g", v);
+            return 1;
+        }
+
+        case 9:
+            printf("<array>");
+            return skip_array(f);
+
+        default:
+            return 0;
+    }
+}
+
+int main(int argc, char **argv)
+{
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s model.gguf\n", argv[0]);
+        return 1;
+    }
+
+    FILE *f = fopen(argv[1], "rb");
+    if (!f) {
+        perror(argv[1]);
+        return 1;
+    }
+
+    char magic[4];
+    uint32_t version;
+    uint64_t tensor_count;
+    uint64_t metadata_count;
+
+    if (fread(magic, 1, 4, f) != 4 ||
+        !read_u32(f, &version) ||
+        !read_u64(f, &tensor_count) ||
+        !read_u64(f, &metadata_count)) {
+        fprintf(stderr, "Invalid GGUF header\n");
+        fclose(f);
+        return 1;
+    }
+
+    printf("GGUF version: %" PRIu32 "\n", version);
+    printf("Tensors:      %" PRIu64 "\n", tensor_count);
+    printf("Metadata:     %" PRIu64 "\n\n", metadata_count);
+
+    for (uint64_t i = 0; i < metadata_count; ++i) {
+        char *key = NULL;
+        uint32_t type;
+
+        if (!read_string(f, &key) || !read_u32(f, &type)) {
+            fprintf(stderr, "Failed reading metadata %" PRIu64 "\n", i);
+            free(key);
+            fclose(f);
+            return 1;
+        }
+
+        printf("%" PRIu64 "  %-40s ", i, key);
+
+        switch (type) {
+            case 0:  printf("UINT8   "); break;
+            case 1:  printf("INT8    "); break;
+            case 2:  printf("UINT16  "); break;
+            case 3:  printf("INT16   "); break;
+            case 4:  printf("UINT32  "); break;
+            case 5:  printf("INT32   "); break;
+            case 6:  printf("FLOAT32 "); break;
+            case 7:  printf("BOOL    "); break;
+            case 8:  printf("STRING  "); break;
+            case 9:  printf("ARRAY   "); break;
+            case 10: printf("UINT64  "); break;
+            case 11: printf("INT64   "); break;
+            case 12: printf("FLOAT64 "); break;
+            default: printf("UNKNOWN "); break;
+        }
+
+        if (!print_metadata_value(f, type)) {
+            fprintf(stderr, "\nFailed reading metadata value for %s\n", key);
+            free(key);
+            fclose(f);
+            return 1;
+        }
+
+        printf("\n");
+        free(key);
+    }
+
+    fclose(f);
+    return 0;
+}

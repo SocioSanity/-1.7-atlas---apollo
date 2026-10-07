@@ -1,0 +1,36 @@
+<|im_start|>system
+You are Atlas LLM 1.0, a thoughtful conversational assistant and capable C programmer. Answer the user's actual point directly; avoid filler and repeating the question. For general questions, explain the main idea with concrete examples and say when uncertain. Do not guess precise numbers or dates when unsure. For complex questions, organize the answer around the most relevant facts and give a clear conclusion. For a large or multi-part problem, decompose it into a few small steps, solve and check each step, then combine the results. Show the steps when they help the user follow the work; when a direct result is clearer and takes less work, give the concise result and only the key checks. Do not pad simple answers with unnecessary steps. For C requests, provide correct, complete code that compiles, then explain how to use it briefly. Ask follow-ups only when needed.
+<|im_end|>
+<|im_start|>user
+Atlas, design a better user interface for yourself. Break the interface proposal into a few small parts and decide which changes give the most usability benefit for the least processing and implementation work. The current app is a native Win32 chat window. Propose a practical prioritized design that improves readability, conversation navigation, composing and sending, response status, and model/reference visibility. Describe the layout, controls, and keyboard behavior. Keep it realistic to implement in plain C Win32, concise enough that we can implement it, and do not write source code yet.<|im_end|>
+<|im_start|>assistant
+Sure, I can help you design a better user interface for your native Win32 chat window. Here's a step-by-step breakdown of the proposed design:
+
+### 1. **Readability**
+- **Font Size**: Increase the font size of the chat messages to make them more readable.
+- **Line Height**: Increase the line height to ensure that each message is displayed on a single line.
+- **Color Scheme**: Use a light background with dark text for better readability.
+
+### 2. **Conversation Navigation**
+- **Message List**: Implement a message list that allows users to scroll through messages easily.
+- **Search Function**: Add a search function to quickly find specific messages.
+- **Message Markers**: Use markers (e.g., dots) to indicate the latest message in each conversation.
+
+### 3. **Composing and Sending**
+- **Message Input Area**: Use a larger input area to allow users to type messages more easily.
+- **Auto-Complete**: Implement auto-complete for common words and phrases.
+- **Send Button**: Ensure the send button is clearly visible and easy to click.
+
+### 4. **Response Status**
+- **Status Indicator**: Display a status indicator (e.g., "Typing", "Sending") next to the user's name.
+- **Notification**: Notify users when their message is sent or received.
+
+### 5. **Model/Reference Visibility**
+- **Model/Reference List**: Display a list of models and references available for users to choose from.
+- **Reference Preview**: Preview the reference content to ensure it is relevant and easy to understand.
+- **Reference Selection**: Allow users to select a reference and view it in a separate window.
+
+### Layout and Controls
+- **Main Window**: Use a main window with a chat area, input area, and navigation bar.
+- **Chat Area**: Use a scrollable chat area to display messages.
+- **Input<|im_end|>

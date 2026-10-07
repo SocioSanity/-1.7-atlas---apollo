@@ -1,0 +1,354 @@
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define QK_K 256
+
+typedef struct {
+    uint8_t ql[128];
+    uint8_t qh[64];
+    int8_t  scales[16];
+    uint16_t d;
+} block_q6_K;
+
+static uint16_t read_u16(const uint8_t *p)
+{
+    return (uint16_t)p[0] |
+           ((uint16_t)p[1] << 8);
+}
+
+static float fp16_to_fp32(uint16_t h)
+{
+    uint32_t sign = ((uint32_t)(h & 0x8000)) << 16;
+    uint32_t exp  = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x03FF;
+    uint32_t f;
+
+    if (exp == 0) {
+        if (mant == 0) {
+            f = sign;
+        } else {
+            int e = -14;
+
+            while ((mant & 0x0400) == 0) {
+                mant <<= 1;
+                e--;
+            }
+
+            mant &= 0x03FF;
+
+            f = sign |
+                ((uint32_t)(e + 127) << 23) |
+                (mant << 13);
+        }
+    }
+    else if (exp == 31) {
+        f = sign | 0x7F800000 | (mant << 13);
+    }
+    else {
+        f = sign |
+            ((exp - 15 + 127) << 23) |
+            (mant << 13);
+    }
+
+    float result;
+    memcpy(&result, &f, sizeof(result));
+    return result;
+}
+
+static void dequant_q6_k(
+    const uint8_t *src,
+    float *dst)
+{
+    const block_q6_K *q =
+        (const block_q6_K *)src;
+
+    const float d =
+        fp16_to_fp32(q->d);
+
+    /*
+     * Q6_K layout:
+     *
+     * 256 values
+     * 128 low 4-bit values
+     * 64 high 2-bit values
+     * 16 signed scales
+     *
+     * Each 64-value section uses four scales.
+     */
+
+    for (int n = 0; n < 256; n += 128) {
+
+        for (int l = 0; l < 32; ++l) {
+
+            const uint8_t q1 =
+                q->ql[l];
+
+            const uint8_t q2 =
+                q->ql[l + 32];
+
+            const uint8_t q3 =
+                q->ql[l + 64];
+
+            const uint8_t q4 =
+                q->ql[l + 96];
+
+            const uint8_t h1 =
+                q->qh[l];
+
+            const int is = l / 16;
+
+            const int sc1 =
+                q->scales[is];
+
+            const int sc2 =
+                q->scales[is + 2];
+
+            const int sc3 =
+                q->scales[is + 4];
+
+            const int sc4 =
+                q->scales[is + 6];
+
+            int v1 =
+                ((q1 & 0x0F) |
+                 ((h1 & 0x03) << 4)) - 32;
+
+            int v2 =
+                ((q2 & 0x0F) |
+                 (((h1 >> 2) & 0x03) << 4)) - 32;
+
+            int v3 =
+                ((q3 & 0x0F) |
+                 (((h1 >> 4) & 0x03) << 4)) - 32;
+
+            int v4 =
+                ((q4 & 0x0F) |
+                 (((h1 >> 6) & 0x03) << 4)) - 32;
+
+            int v5 =
+                ((q1 >> 4) |
+                 ((h1 & 0x03) << 4)) - 32;
+
+            int v6 =
+                ((q2 >> 4) |
+                 (((h1 >> 2) & 0x03) << 4)) - 32;
+
+            int v7 =
+                ((q3 >> 4) |
+                 (((h1 >> 4) & 0x03) << 4)) - 32;
+
+            int v8 =
+                ((q4 >> 4) |
+                 (((h1 >> 6) & 0x03) << 4)) - 32;
+
+            int base = l;
+
+            dst[base] =
+                d * (float)sc1 * (float)v1;
+
+            dst[base + 32] =
+                d * (float)sc2 * (float)v2;
+
+            dst[base + 64] =
+                d * (float)sc3 * (float)v3;
+
+            dst[base + 96] =
+                d * (float)sc4 * (float)v4;
+
+            dst[base + 128] =
+                d * (float)sc1 * (float)v5;
+
+            dst[base + 160] =
+                d * (float)sc2 * (float)v6;
+
+            dst[base + 192] =
+                d * (float)sc3 * (float)v7;
+
+            dst[base + 224] =
+                d * (float)sc4 * (float)v8;
+        }
+
+        if (n == 128)
+            break;
+    }
+
+    /*
+     * The loop above intentionally exposes the raw
+     * Q6_K structure. The complete canonical ordering
+     * is handled below.
+     */
+
+    for (int i = 0; i < 256; ++i)
+        dst[i] = 0.0f;
+
+    for (int l = 0; l < 32; ++l) {
+
+        const uint8_t q0 = q->ql[l];
+        const uint8_t q1 = q->ql[l + 32];
+        const uint8_t q2 = q->ql[l + 64];
+        const uint8_t q3 = q->ql[l + 96];
+
+        const uint8_t h = q->qh[l];
+
+        int sc = l / 16;
+
+        int v0 =
+            ((q0 & 0x0F) |
+             ((h & 0x03) << 4)) - 32;
+
+        int v1 =
+            ((q1 & 0x0F) |
+             (((h >> 2) & 0x03) << 4)) - 32;
+
+        int v2 =
+            ((q2 & 0x0F) |
+             (((h >> 4) & 0x03) << 4)) - 32;
+
+        int v3 =
+            ((q3 & 0x0F) |
+             (((h >> 6) & 0x03) << 4)) - 32;
+
+        int v4 =
+            ((q0 >> 4) |
+             ((h & 0x03) << 4)) - 32;
+
+        int v5 =
+            ((q1 >> 4) |
+             (((h >> 2) & 0x03) << 4)) - 32;
+
+        int v6 =
+            ((q2 >> 4) |
+             (((h >> 4) & 0x03) << 4)) - 32;
+
+        int v7 =
+            ((q3 >> 4) |
+             (((h >> 6) & 0x03) << 4)) - 32;
+
+        dst[l] =
+            d * q->scales[sc] * v0;
+
+        dst[l + 32] =
+            d * q->scales[sc + 1] * v1;
+
+        dst[l + 64] =
+            d * q->scales[sc + 2] * v2;
+
+        dst[l + 96] =
+            d * q->scales[sc + 3] * v3;
+
+        dst[l + 128] =
+            d * q->scales[sc] * v4;
+
+        dst[l + 160] =
+            d * q->scales[sc + 1] * v5;
+
+        dst[l + 192] =
+            d * q->scales[sc + 2] * v6;
+
+        dst[l + 224] =
+            d * q->scales[sc + 3] * v7;
+    }
+}
+
+int main(void)
+{
+    const char *path =
+        "model/atlas-1.0.gguf";
+
+    FILE *f = fopen(path, "rb");
+
+    if (!f) {
+        perror(path);
+        return 1;
+    }
+
+    /*
+     * output.weight:
+     *
+     * Q6_K
+     * dimensions: 1536 x 151936
+     * tensor offset: 0
+     * tensor data start: 5950528
+     */
+    const uint64_t position = 5950528ULL;
+
+    if (_fseeki64(
+            f,
+            (__int64)position,
+            SEEK_SET) != 0) {
+
+        fprintf(stderr, "Seek failed\n");
+        fclose(f);
+        return 1;
+    }
+
+    /*
+     * Q6_K block = 210 bytes.
+     */
+    uint8_t raw[210];
+
+    if (fread(raw, 1, sizeof(raw), f) != sizeof(raw)) {
+        fprintf(stderr, "Read failed\n");
+        fclose(f);
+        return 1;
+    }
+
+    float values[QK_K];
+
+    dequant_q6_k(raw, values);
+
+    printf("========================================\n");
+    printf("        Q6_K DECODER TEST\n");
+    printf("========================================\n\n");
+
+    printf("Tensor: output.weight\n");
+    printf("Tensor position: %llu\n",
+           (unsigned long long)position);
+
+    printf("Block size: 256 elements\n");
+    printf("Block size: 210 bytes\n\n");
+
+    printf("d = %.10g\n\n",
+           fp16_to_fp32(read_u16(raw + 208)));
+
+    printf("Raw scale bytes:\n");
+
+    for (int i = 0; i < 16; ++i)
+        printf("%02X ", raw[192 + i]);
+
+    printf("\n\n");
+
+    printf("First 64 dequantized values:\n\n");
+
+    for (int i = 0; i < 64; ++i)
+        printf("[%03d] % .10f\n", i, values[i]);
+
+    float min = values[0];
+    float max = values[0];
+    double sum = 0.0;
+
+    for (int i = 0; i < QK_K; ++i) {
+
+        if (values[i] < min)
+            min = values[i];
+
+        if (values[i] > max)
+            max = values[i];
+
+        sum += values[i];
+    }
+
+    printf("\nBlock statistics:\n");
+    printf("min  = %.10f\n", min);
+    printf("max  = %.10f\n", max);
+    printf("mean = %.10f\n", (float)(sum / QK_K));
+
+    printf("\n========================================\n");
+    printf("Q6_K block decoded: 256 / 256 values\n");
+    printf("========================================\n");
+
+    fclose(f);
+    return 0;
+}

@@ -1,0 +1,2080 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+typedef struct {
+    uint8_t *data;
+    size_t size;
+} RAM_MODEL;
+
+static RAM_MODEL g_ram_model = {0};
+static int g_gpu_enabled = 0;
+static int g_hybrid_enabled = 0;
+
+static int ram_model_load(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        perror("RAM model fopen");
+        return 0;
+    }
+
+    if (_fseeki64(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return 0;
+    }
+
+    __int64 size = _ftelli64(f);
+    if (size <= 0) {
+        fclose(f);
+        return 0;
+    }
+
+    rewind(f);
+
+    g_ram_model.data = (uint8_t *)malloc((size_t)size);
+    if (!g_ram_model.data) {
+        fclose(f);
+        fprintf(stderr, "RAM allocation failed for model (%ld bytes)\n", size);
+        return 0;
+    }
+
+    if (fread(g_ram_model.data, 1, (size_t)size, f) != (size_t)size) {
+        fclose(f);
+        free(g_ram_model.data);
+        g_ram_model.data = NULL;
+        return 0;
+    }
+
+    fclose(f);
+
+    g_ram_model.size = (size_t)size;
+
+    fprintf(stderr, "Model loaded into RAM: %.2f MB\n",
+           (double)g_ram_model.size / (1024.0 * 1024.0));
+    fprintf(stderr, "Inference data source: RAM\n");
+
+    return 1;
+}
+
+static void ram_model_free(void)
+{
+    free(g_ram_model.data);
+    g_ram_model.data = NULL;
+    g_ram_model.size = 0;
+}
+
+#include <stdint.h>
+#include <string.h>
+#include <math.h>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include "gpu_matvec.h"
+
+#define GGUF_MAGIC 0x46554747u
+
+#define GGML_TYPE_F32   0
+#define GGML_TYPE_Q5_0  6
+#define GGML_TYPE_Q8_0  8
+#define GGML_TYPE_Q4_K  12
+#define GGML_TYPE_Q6_K  14
+
+#define QK_K       256
+#define Q4K_BYTES  144
+#define Q6K_BYTES  210
+
+#if defined(ATLAS_COMPACT)
+#define HIDDEN_SIZE 896
+#define Q_DIM       896
+#define KV_DIM      128
+#define Q_HEADS     14
+#define HEAD_DIM    64
+#define ROPE_BASE   1000000.0f
+#else
+#define HIDDEN_SIZE 1536
+#define Q_DIM       1536
+#define KV_DIM      256
+#define Q_HEADS     12
+#define HEAD_DIM    128
+#define KV_HEADS    2
+#define ROPE_BASE   1000000.0f
+#endif
+#ifndef KV_HEADS
+#define KV_HEADS    2
+#endif
+#define RMS_EPS     1.0e-6f
+
+static size_t quant_block_elements(uint32_t type)
+{
+    return (type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q8_0) ? 32 :
+           (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q6_K) ? QK_K : 0;
+}
+
+static size_t quant_block_bytes(uint32_t type)
+{
+    switch (type) {
+        case GGML_TYPE_Q5_0: return 22;
+        case GGML_TYPE_Q8_0: return 34;
+        case GGML_TYPE_Q4_K: return Q4K_BYTES;
+        case GGML_TYPE_Q6_K: return Q6K_BYTES;
+        default: return 0;
+    }
+}
+
+typedef struct {
+    char name[256];
+    uint32_t n_dims;
+    uint64_t dims[4];
+    uint32_t type;
+    uint64_t offset;
+} TensorInfo;
+
+typedef struct {
+    FILE *file;
+    uint64_t data_base;
+    uint64_t tensor_count;
+    uint64_t metadata_count;
+    TensorInfo *tensor_index;
+    size_t *tensor_slots;
+    size_t tensor_capacity;
+} GGUFFile;
+
+static size_t tensor_name_hash(const char *s)
+{
+    size_t h = (size_t)1469598103934665603ull;
+    while (*s) { h ^= (unsigned char)*s++; h *= (size_t)1099511628211ull; }
+    return h;
+}
+
+typedef struct {
+    const char *left, *right;
+    uint32_t rank;
+} MergeEntry;
+
+typedef struct {
+    char **tokens;
+    size_t token_count;
+    char **merges;
+    size_t merge_count;
+    uint32_t *vocab_slots;
+    uint32_t *merge_slots;
+    MergeEntry *merge_entries;
+    size_t vocab_capacity, merge_capacity;
+} Tokenizer;
+
+/* ========================================================= */
+/* Basic readers                                              */
+/* ========================================================= */
+
+static int read_u32(FILE *f, uint32_t *v)
+{
+    return fread(v, sizeof(*v), 1, f) == 1;
+}
+
+static int read_u64(FILE *f, uint64_t *v)
+{
+    return fread(v, sizeof(*v), 1, f) == 1;
+}
+
+/* ========================================================= */
+/* FP16                                                        */
+/* ========================================================= */
+
+static float half_to_float(uint16_t h)
+{
+    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t exp  = (h >> 10) & 0x1Fu;
+    uint32_t mant = h & 0x03FFu;
+    uint32_t bits;
+
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;
+        } else {
+            exp = 1;
+
+            while ((mant & 0x0400u) == 0) {
+                mant <<= 1;
+                --exp;
+            }
+
+            mant &= 0x03FFu;
+
+            bits =
+                sign |
+                ((exp + 112u) << 23) |
+                (mant << 13);
+        }
+    }
+    else if (exp == 31) {
+        bits =
+            sign |
+            0x7F800000u |
+            (mant << 13);
+    }
+    else {
+        bits =
+            sign |
+            ((exp + 112u) << 23) |
+            (mant << 13);
+    }
+
+    float result;
+
+    memcpy(&result, &bits, sizeof(result));
+
+    return result;
+}
+
+/* ========================================================= */
+/* GGUF metadata skipping                                     */
+/* ========================================================= */
+
+static int skip_string(FILE *f)
+{
+    uint64_t len;
+
+    if (!read_u64(f, &len))
+        return 0;
+
+    if (len > INT64_MAX) return 0;
+    return _fseeki64(f, (__int64)len, SEEK_CUR) == 0;
+}
+
+static int skip_value(FILE *f, uint32_t type);
+
+static int skip_array(FILE *f)
+{
+    uint32_t element_type;
+    uint64_t count;
+
+    if (!read_u32(f, &element_type))
+        return 0;
+
+    if (!read_u64(f, &count))
+        return 0;
+
+    for (uint64_t i = 0; i < count; ++i) {
+        if (!skip_value(f, element_type))
+            return 0;
+    }
+
+    return 1;
+}
+
+static int skip_value(FILE *f, uint32_t type)
+{
+    switch (type) {
+        case 0:
+        case 1:
+        case 7:
+            return _fseeki64(f, 1, SEEK_CUR) == 0;
+
+        case 2:
+        case 3:
+            return _fseeki64(f, 2, SEEK_CUR) == 0;
+
+        case 4:
+        case 5:
+        case 6:
+            return _fseeki64(f, 4, SEEK_CUR) == 0;
+
+        case 8:
+            return skip_string(f);
+
+        case 9:
+            return skip_array(f);
+
+        case 10:
+        case 11:
+        case 12:
+            return _fseeki64(f, 8, SEEK_CUR) == 0;
+
+        default:
+            return 0;
+    }
+}
+
+/* ========================================================= */
+/* Tensor directory                                           */
+/* ========================================================= */
+
+static int read_tensor(FILE *f, TensorInfo *t)
+{
+    uint64_t name_len;
+
+    memset(t, 0, sizeof(*t));
+
+    if (!read_u64(f, &name_len))
+        return 0;
+
+    if (name_len >= sizeof(t->name))
+        return 0;
+
+    if (fread(
+            t->name,
+            1,
+            (size_t)name_len,
+            f) != name_len)
+        return 0;
+
+    t->name[name_len] = '\0';
+
+    if (!read_u32(f, &t->n_dims))
+        return 0;
+
+    if (t->n_dims > 4)
+        return 0;
+
+    for (uint32_t i = 0; i < t->n_dims; ++i) {
+        if (!read_u64(f, &t->dims[i]))
+            return 0;
+    }
+
+    if (!read_u32(f, &t->type))
+        return 0;
+
+    if (!read_u64(f, &t->offset))
+        return 0;
+
+    return 1;
+}
+
+/* ========================================================= */
+/* Open GGUF                                                  */
+/* ========================================================= */
+
+static int gguf_open(const char *path, GGUFFile *g)
+{
+    FILE *f = fopen(path, "rb");
+
+    if (!f) {
+        perror("fopen");
+        return 0;
+    }
+
+    uint32_t magic;
+    uint32_t version;
+    uint64_t tensors;
+    uint64_t metadata;
+
+    if (!read_u32(f, &magic) ||
+        !read_u32(f, &version) ||
+        !read_u64(f, &tensors) ||
+        !read_u64(f, &metadata)) {
+
+        fclose(f);
+        return 0;
+    }
+
+    if (magic != GGUF_MAGIC) {
+        fprintf(stderr, "Invalid GGUF magic.\n");
+        fclose(f);
+        return 0;
+    }
+
+    for (uint64_t i = 0; i < metadata; ++i) {
+        uint64_t key_len;
+
+        if (!read_u64(f, &key_len)) {
+            fclose(f);
+            return 0;
+        }
+
+        if (key_len > INT64_MAX || _fseeki64(f, (__int64)key_len, SEEK_CUR) != 0) {
+            fclose(f);
+            return 0;
+        }
+
+        uint32_t type;
+
+        if (!read_u32(f, &type)) {
+            fclose(f);
+            return 0;
+        }
+
+        if (!skip_value(f, type)) {
+            fclose(f);
+            return 0;
+        }
+    }
+
+    if (tensors > SIZE_MAX / sizeof(TensorInfo) || tensors > (SIZE_MAX / 2)) {
+        fclose(f); return 0;
+    }
+    size_t capacity = 8;
+    while (capacity < (size_t)tensors * 2) {
+        if (capacity > SIZE_MAX / 2) { fclose(f); return 0; }
+        capacity *= 2;
+    }
+    TensorInfo *index = calloc((size_t)tensors, sizeof(*index));
+    size_t *slots = calloc(capacity, sizeof(*slots));
+    if ((!index && tensors) || !slots) {
+        free(index); free(slots); fclose(f); return 0;
+    }
+    for (uint64_t i = 0; i < tensors; ++i) {
+        if (!read_tensor(f, &index[i])) {
+            free(index); free(slots); fclose(f); return 0;
+        }
+        size_t slot = tensor_name_hash(index[i].name) & (capacity - 1);
+        while (slots[slot]) slot = (slot + 1) & (capacity - 1);
+        slots[slot] = (size_t)i + 1;
+    }
+
+    __int64 tensor_end = _ftelli64(f);
+
+    if (tensor_end < 0) {
+        fclose(f);
+        return 0;
+    }
+
+    uint64_t data_base =
+        ((uint64_t)tensor_end + 31u) & ~UINT64_C(31);
+
+    g->file = f;
+    g->data_base = data_base;
+    g->tensor_count = tensors;
+    g->metadata_count = metadata;
+    g->tensor_index = index;
+    g->tensor_slots = slots;
+    g->tensor_capacity = capacity;
+
+    return 1;
+}
+
+static void gguf_close(GGUFFile *g)
+{
+    if (g->file) fclose(g->file);
+    free(g->tensor_index);
+    free(g->tensor_slots);
+    memset(g, 0, sizeof(*g));
+}
+
+static char *read_string(FILE *f)
+{
+    uint64_t n;
+    if (!read_u64(f, &n) || n > 16 * 1024 * 1024 || n > SIZE_MAX - 1)
+        return NULL;
+    char *s = malloc((size_t)n + 1);
+    if (!s) return NULL;
+    if (fread(s, 1, (size_t)n, f) != n) { free(s); return NULL; }
+    s[n] = 0;
+    return s;
+}
+
+static int read_string_array(FILE *f, uint64_t n, char ***out)
+{
+    if (n > 1000000 || n > SIZE_MAX / sizeof(char *)) return 0;
+    char **a = calloc((size_t)n, sizeof(*a));
+    if (!a) return 0;
+    for (uint64_t i = 0; i < n; ++i) {
+        a[i] = read_string(f);
+        if (!a[i]) {
+            for (uint64_t j = 0; j < i; ++j) free(a[j]);
+            free(a); return 0;
+        }
+    }
+    *out = a;
+    return 1;
+}
+
+static void tokenizer_free(Tokenizer *t)
+{
+    for (size_t i = 0; i < t->token_count; ++i) free(t->tokens[i]);
+    for (size_t i = 0; i < t->merge_count; ++i) free(t->merges[i]);
+    free(t->tokens); free(t->merges); free(t->vocab_slots);
+    free(t->merge_slots); free(t->merge_entries); memset(t, 0, sizeof(*t));
+}
+
+static uint64_t hash_text(const char *s)
+{
+    uint64_t h = 1469598103934665603ULL;
+    for (; *s; ++s) { h ^= (unsigned char)*s; h *= 1099511628211ULL; }
+    return h;
+}
+
+static uint64_t hash_pair(const char *a, const char *b)
+{
+    uint64_t h = hash_text(a);
+    h ^= 0xff; h *= 1099511628211ULL;
+    for (; *b; ++b) { h ^= (unsigned char)*b; h *= 1099511628211ULL; }
+    return h;
+}
+
+static int tokenizer_index(Tokenizer *t)
+{
+    size_t vc = 1, mc = 1;
+    while (vc < t->token_count * 2) vc <<= 1;
+    while (mc < t->merge_count * 2) mc <<= 1;
+    t->vocab_slots = calloc(vc, sizeof(uint32_t));
+    t->merge_slots = calloc(mc, sizeof(uint32_t));
+    t->merge_entries = calloc(t->merge_count, sizeof(MergeEntry));
+    if (!t->vocab_slots || !t->merge_slots || !t->merge_entries) return 0;
+    t->vocab_capacity = vc; t->merge_capacity = mc;
+    for (size_t i = 0; i < t->token_count; ++i) {
+        size_t slot = (size_t)hash_text(t->tokens[i]) & (vc - 1);
+        while (t->vocab_slots[slot]) slot = (slot + 1) & (vc - 1);
+        t->vocab_slots[slot] = (uint32_t)i + 1;
+    }
+    for (size_t i = 0; i < t->merge_count; ++i) {
+        char *sep = strchr(t->merges[i], ' ');
+        if (!sep) return 0;
+        *sep = 0;
+        t->merge_entries[i].left = t->merges[i];
+        t->merge_entries[i].right = sep + 1;
+        t->merge_entries[i].rank = (uint32_t)i;
+        size_t slot = (size_t)hash_pair(t->merges[i], sep + 1) & (mc - 1);
+        while (t->merge_slots[slot]) slot = (slot + 1) & (mc - 1);
+        t->merge_slots[slot] = (uint32_t)i + 1;
+    }
+    return 1;
+}
+
+static int token_id(Tokenizer *t, const char *s, uint32_t *id)
+{
+    size_t slot = (size_t)hash_text(s) & (t->vocab_capacity - 1);
+    while (t->vocab_slots[slot]) {
+        uint32_t candidate = t->vocab_slots[slot] - 1;
+        if (!strcmp(t->tokens[candidate], s)) { *id = candidate; return 1; }
+        slot = (slot + 1) & (t->vocab_capacity - 1);
+    }
+    return 0;
+}
+
+static uint32_t merge_rank(Tokenizer *t, const char *a, const char *b)
+{
+    size_t slot = (size_t)hash_pair(a, b) & (t->merge_capacity - 1);
+    while (t->merge_slots[slot]) {
+        MergeEntry *e = &t->merge_entries[t->merge_slots[slot] - 1];
+        if (!strcmp(e->left, a) && !strcmp(e->right, b)) return e->rank;
+        slot = (slot + 1) & (t->merge_capacity - 1);
+    }
+    return UINT32_MAX;
+}
+
+static size_t utf8_put(uint32_t cp, char out[5])
+{
+    if (cp < 0x80) { out[0] = (char)cp; out[1] = 0; return 1; }
+    if (cp < 0x800) { out[0] = (char)(0xc0 | (cp >> 6)); out[1] = (char)(0x80 | (cp & 63)); out[2] = 0; return 2; }
+    if (cp < 0x10000) { out[0] = (char)(0xe0 | (cp >> 12)); out[1] = (char)(0x80 | ((cp >> 6) & 63)); out[2] = (char)(0x80 | (cp & 63)); out[3] = 0; return 3; }
+    out[0] = (char)(0xf0 | (cp >> 18)); out[1] = (char)(0x80 | ((cp >> 12) & 63)); out[2] = (char)(0x80 | ((cp >> 6) & 63)); out[3] = (char)(0x80 | (cp & 63)); out[4] = 0; return 4;
+}
+
+static size_t encode_chunk(Tokenizer *t, const char *bytes, size_t n, uint32_t *out, size_t cap)
+{
+    if (!n) return 0;
+    char **parts = calloc(n, sizeof(char *));
+    if (!parts) return 0;
+    size_t count = 0;
+    for (size_t i = 0; i < n; ++i) {
+        unsigned b = (unsigned char)bytes[i];
+        unsigned cp = b;
+        if (!((b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255))) {
+            unsigned offset = 0;
+            for (unsigned x = 0; x < b; ++x)
+                if (!((x >= 33 && x <= 126) || (x >= 161 && x <= 172) || (x >= 174 && x <= 255))) ++offset;
+            cp = 256 + offset;
+        }
+        char tmp[5]; size_t len = utf8_put(cp, tmp);
+        parts[count] = malloc(len + 1);
+        if (!parts[count]) goto fail;
+        memcpy(parts[count++], tmp, len + 1);
+    }
+    while (count > 1) {
+        uint32_t best = UINT32_MAX; size_t at = count;
+        for (size_t i = 0; i + 1 < count; ++i) {
+            uint32_t rank = merge_rank(t, parts[i], parts[i + 1]);
+            if (rank < best) { best = rank; at = i; }
+        }
+        if (at == count) break;
+        size_t a = strlen(parts[at]), b = strlen(parts[at + 1]);
+        char *joined = malloc(a + b + 1);
+        if (!joined) goto fail;
+        memcpy(joined, parts[at], a); memcpy(joined + a, parts[at + 1], b + 1);
+        free(parts[at]); free(parts[at + 1]); parts[at] = joined;
+        memmove(parts + at + 1, parts + at + 2, (count - at - 2) * sizeof(char *));
+        --count;
+    }
+    if (count > cap) goto fail;
+    for (size_t i = 0; i < count; ++i)
+        if (!token_id(t, parts[i], &out[i])) goto fail;
+    for (size_t i = 0; i < count; ++i) free(parts[i]);
+    free(parts); return count;
+fail:
+    for (size_t i = 0; i < count; ++i) free(parts[i]);
+    free(parts); return 0;
+}
+
+static int is_space_byte(unsigned char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
+static int is_word_byte(unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c >= 128; }
+
+static size_t tokenize_text(Tokenizer *t, const char *text, uint32_t *out, size_t cap)
+{
+    size_t n = strlen(text), total = 0, pos = 0;
+    while (pos < n) {
+        size_t start = pos;
+        if (is_space_byte((unsigned char)text[pos])) {
+            if (text[pos] == '\r' || text[pos] == '\n') {
+                while (pos < n && (text[pos] == '\r' || text[pos] == '\n')) ++pos;
+                size_t got = encode_chunk(t, text + start, pos - start, out + total, cap - total);
+                if (!got) return 0;
+                total += got; continue;
+            }
+            if (text[pos] == '\t') {
+                while (pos < n && text[pos] == '\t') ++pos;
+                size_t got = encode_chunk(t, text + start, pos - start, out + total, cap - total);
+                if (!got) return 0;
+                total += got; continue;
+            }
+            while (pos < n && text[pos] == ' ') ++pos;
+            size_t spaces = pos - start;
+            if (pos == n) {
+                size_t got = encode_chunk(t, text + start, spaces, out + total, cap - total);
+                if (!got) return 0;
+                total += got; break;
+            }
+            if (spaces > 1) {
+                size_t got = encode_chunk(t, text + start, spaces - 1, out + total, cap - total);
+                if (!got) return 0;
+                total += got; start = pos - 1;
+            } else if (!is_space_byte((unsigned char)text[pos])) {
+                /* GPT-style BPE keeps one leading space attached to the next word. */
+                start = pos - 1;
+            }
+        }
+        unsigned char c = (unsigned char)text[pos];
+        if (c == '\'') {
+            static const char *forms[] = { "'s", "'t", "'re", "'ve", "'m", "'ll", "'d" };
+            size_t matched = 0;
+            for (size_t f = 0; f < sizeof(forms) / sizeof(forms[0]); ++f) {
+                size_t len = strlen(forms[f]);
+                if (pos + len <= n && _strnicmp(text + pos, forms[f], len) == 0) { matched = len; break; }
+            }
+            if (matched) {
+                size_t got = encode_chunk(t, text + start, pos - start + matched, out + total, cap - total);
+                if (!got) return 0;
+                total += got; pos += matched; continue;
+            }
+        }
+        int kind = is_word_byte(c) ? 1 : ((c >= '0' && c <= '9') ? 2 : 3);
+        size_t end = pos + 1;
+        while (end < n) {
+            unsigned char d = (unsigned char)text[end];
+            int dk = is_word_byte(d) ? 1 : ((d >= '0' && d <= '9') ? 2 : (is_space_byte(d) ? 0 : 3));
+            if (dk != kind || dk == 0) break;
+            if (kind == 2 && end - pos >= 3) break;
+            ++end;
+        }
+        if (kind == 3) while (end < n && (text[end] == '\r' || text[end] == '\n')) ++end;
+        size_t got = encode_chunk(t, text + start, end - start, out + total, cap - total);
+        if (!got) return 0;
+        total += got; pos = end;
+    }
+    return total;
+}
+
+static size_t tokenize_prompt(Tokenizer *t, const char *text, uint32_t *out, size_t cap)
+{
+    size_t total = 0, start = 0, n = strlen(text);
+    for (size_t i = 0; i < n;) {
+        if (i + 2 < n && text[i] == '<' && text[i + 1] == '|') {
+            const char *end = strstr(text + i, "|>");
+            if (end) {
+                size_t endpos = (size_t)(end - text) + 2;
+                char *special = malloc(endpos - i + 1);
+                if (!special) return 0;
+                memcpy(special, text + i, endpos - i); special[endpos - i] = 0;
+                uint32_t id;
+                if (token_id(t, special, &id)) {
+                    size_t piece_len = i - start;
+                    char *piece = malloc(piece_len + 1);
+                    if (!piece) { free(special); return 0; }
+                    memcpy(piece, text + start, piece_len); piece[piece_len] = 0;
+                    size_t got = tokenize_text(t, piece, out + total, cap - total);
+                    free(piece);
+                    free(special);
+                    if ((i > start && !got) || total + got + 1 > cap) return 0;
+                    total += got; out[total++] = id; i = endpos; start = i; continue;
+                }
+                free(special);
+            }
+        }
+        ++i;
+    }
+    size_t piece_len = n - start;
+    char *piece = malloc(piece_len + 1);
+    if (!piece) return 0;
+    memcpy(piece, text + start, piece_len); piece[piece_len] = 0;
+    size_t got = tokenize_text(t, piece, out + total, cap - total);
+    free(piece);
+    if ((n > start && !got) || total + got > cap) return 0;
+    return total + got;
+}
+
+static size_t utf8_read_cp(const unsigned char *s, size_t n, uint32_t *cp)
+{
+    if (!n) return 0;
+    if (s[0] < 0x80) { *cp = s[0]; return 1; }
+    if ((s[0] & 0xe0) == 0xc0 && n >= 2) { *cp = ((s[0]&31)<<6) | (s[1]&63); return 2; }
+    if ((s[0] & 0xf0) == 0xe0 && n >= 3) { *cp = ((s[0]&15)<<12) | ((s[1]&63)<<6) | (s[2]&63); return 3; }
+    if ((s[0] & 0xf8) == 0xf0 && n >= 4) { *cp = ((s[0]&7)<<18) | ((s[1]&63)<<12) | ((s[2]&63)<<6) | (s[3]&63); return 4; }
+    *cp = s[0]; return 1;
+}
+
+static void decode_token(Tokenizer *t, uint32_t id, FILE *out)
+{
+    if (id >= t->token_count) return;
+    const char *s = t->tokens[id];
+    if (s[0] == '<' && s[1] == '|') return;
+    size_t n = strlen(s);
+    for (size_t i = 0; i < n;) {
+        uint32_t cp; size_t used = utf8_read_cp((const unsigned char *)s + i, n - i, &cp); i += used;
+        int found = 0;
+        for (unsigned b = 0; b <= 255; ++b) {
+            unsigned mapped = b;
+            if (!((b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255))) {
+                unsigned offset = 0;
+                for (unsigned x = 0; x < b; ++x)
+                    if (!((x >= 33 && x <= 126) || (x >= 161 && x <= 172) || (x >= 174 && x <= 255))) ++offset;
+                mapped = 256 + offset;
+            }
+            if (cp == mapped) { fputc((int)b, out); found = 1; break; }
+        }
+        if (!found && cp < 256) fputc((int)cp, out);
+    }
+}
+
+static int load_tokenizer(GGUFFile *g, Tokenizer *tok)
+{
+    FILE *f = g->file;
+    memset(tok, 0, sizeof(*tok));
+    if (_fseeki64(f, 0, SEEK_SET) != 0) return 0;
+    uint32_t magic, version;
+    uint64_t tensors, metadata;
+    if (!read_u32(f, &magic) || !read_u32(f, &version) ||
+        !read_u64(f, &tensors) || !read_u64(f, &metadata)) return 0;
+    for (uint64_t i = 0; i < metadata; ++i) {
+        char *key = read_string(f);
+        uint32_t type;
+        if (!key || !read_u32(f, &type)) { free(key); goto fail; }
+        if (type == 9) {
+            uint32_t elem_type;
+            uint64_t count;
+            if (!read_u32(f, &elem_type) || !read_u64(f, &count)) { free(key); goto fail; }
+            if (elem_type == 8 && strcmp(key, "tokenizer.ggml.tokens") == 0) {
+                if (!read_string_array(f, count, &tok->tokens)) { free(key); goto fail; }
+                tok->token_count = (size_t)count;
+            } else if (elem_type == 8 && strcmp(key, "tokenizer.ggml.merges") == 0) {
+                if (!read_string_array(f, count, &tok->merges)) { free(key); goto fail; }
+                tok->merge_count = (size_t)count;
+            } else {
+                for (uint64_t j = 0; j < count; ++j)
+                    if (!skip_value(f, elem_type)) { free(key); goto fail; }
+            }
+        } else if (!skip_value(f, type)) { free(key); goto fail; }
+        free(key);
+    }
+    if (!tok->tokens || !tok->token_count || !tok->merges || !tok->merge_count) goto fail;
+    return 1;
+fail:
+    tokenizer_free(tok);
+    return 0;
+}
+
+/* ========================================================= */
+/* Tensor lookup                                              */
+/* ========================================================= */
+
+static int find_tensor(
+    GGUFFile *g,
+    const char *name,
+    TensorInfo *result)
+{
+    if (!g->tensor_slots || !g->tensor_capacity) return 0;
+    size_t slot = tensor_name_hash(name) & (g->tensor_capacity - 1);
+    while (g->tensor_slots[slot]) {
+        const TensorInfo *t = &g->tensor_index[g->tensor_slots[slot] - 1];
+        if (strcmp(t->name, name) == 0) { *result = *t; return 1; }
+        slot = (slot + 1) & (g->tensor_capacity - 1);
+    }
+    return 0;
+}
+
+/* ========================================================= */
+/* Q4_K                                                       */
+/* ========================================================= */
+
+static void get_scale_min_k4(
+    int j,
+    const uint8_t *q,
+    uint8_t *d,
+    uint8_t *m)
+{
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    }
+    else {
+        *d =
+            (q[j + 4] & 0x0F) |
+            ((q[j - 4] >> 6) << 4);
+
+        *m =
+            (q[j + 4] >> 4) |
+            ((q[j] >> 6) << 4);
+    }
+}
+
+static void dequant_q4_k(
+    const uint8_t *src,
+    float *dst)
+{
+    uint16_t d_bits;
+    uint16_t m_bits;
+
+    memcpy(&d_bits, src, 2);
+    memcpy(&m_bits, src + 2, 2);
+
+    float d = half_to_float(d_bits);
+    float min = half_to_float(m_bits);
+
+    const uint8_t *scales = src + 4;
+    const uint8_t *q = src + 16;
+
+    int is = 0;
+
+    for (int j = 0; j < 256; j += 64) {
+        uint8_t sc1, m1;
+        uint8_t sc2, m2;
+
+        get_scale_min_k4(
+            is + 0,
+            scales,
+            &sc1,
+            &m1);
+
+        get_scale_min_k4(
+            is + 1,
+            scales,
+            &sc2,
+            &m2);
+
+        float d1 = d * sc1;
+        float mval1 = min * m1;
+
+        float d2 = d * sc2;
+        float mval2 = min * m2;
+
+        for (int l = 0; l < 32; ++l) {
+            dst[j + l] =
+                d1 * (float)(q[l] & 0x0F) -
+                mval1;
+        }
+
+        for (int l = 0; l < 32; ++l) {
+            dst[j + 32 + l] =
+                d2 * (float)(q[l] >> 4) -
+                mval2;
+        }
+
+        q += 32;
+        is += 2;
+    }
+}
+
+/* ========================================================= */
+/* Q6_K                                                       */
+/* ========================================================= */
+
+static void dequant_q6_k(
+    const uint8_t *src,
+    float *dst)
+{
+    const uint8_t *ql = src;
+    const uint8_t *qh = src + 128;
+    const int8_t *scales =
+        (const int8_t *)(src + 192);
+
+    uint16_t d_bits;
+
+    memcpy(&d_bits, src + 208, 2);
+
+    float d = half_to_float(d_bits);
+
+    for (int half = 0; half < 2; ++half) {
+        for (int lane = 0; lane < 32; ++lane) {
+            uint8_t h = qh[half * 32 + lane];
+            uint8_t q0 = ql[half * 64 + lane];
+            uint8_t q1 = ql[half * 64 + 32 + lane];
+            int scale_base = half * 8 + lane / 16;
+            int values[4] = {
+                (q0 & 15) | ((h & 3) << 4),
+                (q1 & 15) | (((h >> 2) & 3) << 4),
+                (q0 >> 4) | (((h >> 4) & 3) << 4),
+                (q1 >> 4) | (((h >> 6) & 3) << 4)
+            };
+            for (int chunk = 0; chunk < 4; ++chunk) {
+                int idx = half * 128 + chunk * 32 + lane;
+                float scale = d * (float)scales[scale_base + chunk * 2];
+                dst[idx] = scale * (float)(values[chunk] - 32);
+            }
+        }
+    }
+}
+
+static void dequant_block(uint32_t type, const uint8_t *src, float *dst)
+{
+    if (type == GGML_TYPE_Q4_K) { dequant_q4_k(src, dst); return; }
+    if (type == GGML_TYPE_Q6_K) { dequant_q6_k(src, dst); return; }
+    uint16_t bits; memcpy(&bits, src, sizeof(bits));
+    float d = half_to_float(bits);
+    if (type == GGML_TYPE_Q5_0) {
+        uint32_t high; memcpy(&high, src + 2, sizeof(high));
+        for (unsigned i = 0; i < 32; ++i) {
+            unsigned byte = src[6 + (i & 15)];
+            unsigned q = i < 16 ? byte & 15u : byte >> 4;
+            q |= ((high >> i) & 1u) << 4;
+            dst[i] = d * ((float)q - 16.0f);
+        }
+        return;
+    }
+    if (type == GGML_TYPE_Q8_0) {
+        for (unsigned i = 0; i < 32; ++i)
+            dst[i] = d * (float)(int8_t)src[2 + i];
+    }
+}
+
+/* ========================================================= */
+/* Generic matrix-vector                                     */
+/* ========================================================= */
+
+typedef struct {
+    GGUFFile *g; const TensorInfo *t; const float *input; float *output;
+    uint64_t rows, blocks, first, last; size_t block_bytes, block_elements;
+    volatile LONG failed;
+} MatvecJob;
+
+static void matvec_rows(MatvecJob *job)
+{
+    uint8_t block[Q6K_BYTES];
+    float weights[QK_K];
+    for (uint64_t row = job->first; row < job->last; ++row) {
+        float sum = 0.0f;
+        for (uint64_t b = 0; b < job->blocks; ++b) {
+            uint64_t absolute = (uint64_t)job->g->data_base + job->t->offset +
+                (row * job->blocks + b) * job->block_bytes;
+            if (absolute > g_ram_model.size ||
+                job->block_bytes > g_ram_model.size - (size_t)absolute) {
+                InterlockedExchange(&job->failed, 1);
+                break;
+            }
+            memcpy(block, g_ram_model.data + (size_t)absolute, job->block_bytes);
+            dequant_block(job->t->type, block, weights);
+            const float *x = job->input + b * job->block_elements;
+            for (size_t i = 0; i < job->block_elements; ++i) sum += weights[i] * x[i];
+        }
+        job->output[row] = sum;
+    }
+}
+
+static VOID CALLBACK matvec_pool_cb(PTP_CALLBACK_INSTANCE inst, PVOID ctx, PTP_WORK work)
+{ (void)inst; (void)work; matvec_rows((MatvecJob *)ctx); }
+static DWORD WINAPI matvec_thread(void *arg)
+{
+    matvec_rows((MatvecJob *)arg);
+    return 0;
+}
+
+static int tensor_matvec_cpu_range(GGUFFile *g, const TensorInfo *t,
+                                   const float *input, float *output,
+                                   uint64_t first, uint64_t last)
+{
+    uint64_t cols=t->dims[0], rows=t->dims[1];
+    size_t bytes=quant_block_bytes(t->type), block_elements=quant_block_elements(t->type);
+    if (!bytes || !block_elements || !cols || cols%block_elements || !rows || first>last || last>rows) return 0;
+    if (first==last) return 1;
+    SYSTEM_INFO si; GetSystemInfo(&si);
+    DWORD workers=si.dwNumberOfProcessors; if (!workers) workers=1;
+    if (workers>16) workers=16;
+    if (workers>last-first) workers=(DWORD)(last-first);
+    MatvecJob jobs[16]; HANDLE threads[15]; DWORD made=0;
+    for (DWORD i=0;i<workers;++i) {
+        jobs[i]=(MatvecJob){g,t,input,output,rows,cols/block_elements,
+            first+(last-first)*i/workers,first+(last-first)*(i+1)/workers,
+            bytes,block_elements,0};
+        
+        
+    }
+    PTP_WORK pool_work[16];
+    for (DWORD pi = 1; pi < workers; ++pi) {
+        pool_work[pi] = CreateThreadpoolWork(matvec_pool_cb, &jobs[pi], NULL);
+        if (pool_work[pi]) SubmitThreadpoolWork(pool_work[pi]);
+        else matvec_rows(&jobs[pi]);
+    }
+    matvec_rows(&jobs[0]);
+    for (DWORD pi = 1; pi < workers; ++pi)
+        if (pool_work[pi]) { WaitForThreadpoolWorkCallbacks(pool_work[pi], FALSE); CloseThreadpoolWork(pool_work[pi]); }
+    for (DWORD i=0;i<workers;++i) if (jobs[i].failed) return 0;
+    return 1;
+}
+
+static int tensor_matvec_cpu(GGUFFile *g,const TensorInfo *t,
+                             const float *input,float *output)
+{
+    return tensor_matvec_cpu_range(g,t,input,output,0,t->dims[1]);
+}
+
+typedef struct { const BrainGpuMatvec *ops; size_t count; int result; } GpuBatchJob;
+
+static DWORD WINAPI gpu_batch_thread(void *arg)
+{
+    GpuBatchJob *job=(GpuBatchJob *)arg;
+    job->result=brain_gpu_matvec_batch(job->ops,job->count);
+    return 0;
+}
+
+static int tensor_matvec_hybrid(GGUFFile *g,const TensorInfo *const *tensors,
+                                float *const *outputs,size_t count,const float *input)
+{
+    BrainGpuMatvec gpu_ops[3]; uint64_t cpu_rows[3]={0};
+    if (!count || count>3) return 0;
+    for (size_t i=0;i<count;++i) {
+        const TensorInfo *t=tensors[i];
+        size_t elems=quant_block_elements(t?t->type:UINT32_MAX);
+        size_t bytes=quant_block_bytes(t?t->type:UINT32_MAX);
+        if (!t || t->n_dims<2 || !elems || !bytes || t->dims[0]%elems || !outputs[i]) return 0;
+        uint64_t rows=t->dims[1],cols=t->dims[0];
+        uint64_t data=(uint64_t)g->data_base+t->offset;
+        if (g_hybrid_enabled && g_gpu_enabled && rows>=8192) cpu_rows[i]=rows/4;
+        uint64_t gpu_first=cpu_rows[i];
+        gpu_ops[i]=(BrainGpuMatvec){data+gpu_first*(cols/elems)*bytes,
+            rows-gpu_first,cols,t->type,input,outputs[i]+gpu_first};
+    }
+
+    if (g_gpu_enabled && !g_hybrid_enabled) {
+        if (brain_gpu_matvec_batch(gpu_ops,count)) return 1;
+    }
+    if (g_gpu_enabled && g_hybrid_enabled) {
+        GpuBatchJob job={gpu_ops,count,0};
+        HANDLE thread=CreateThread(NULL,0,gpu_batch_thread,&job,0,NULL);
+        if (thread) {
+            int cpu_ok=1;
+            for (size_t i=0;i<count;++i)
+                if (!tensor_matvec_cpu_range(g,tensors[i],input,outputs[i],0,cpu_rows[i])) cpu_ok=0;
+            WaitForSingleObject(thread,INFINITE); CloseHandle(thread);
+            if (job.result) return cpu_ok;
+            if (cpu_ok) {
+                for (size_t i=0;i<count;++i)
+                    if (!tensor_matvec_cpu_range(g,tensors[i],input,outputs[i],cpu_rows[i],tensors[i]->dims[1])) return 0;
+                return 1;
+            }
+        }
+    }
+
+    for (size_t i=0;i<count;++i)
+        if (!tensor_matvec_cpu_range(g,tensors[i],input,outputs[i],0,tensors[i]->dims[1])) return 0;
+    return 1;
+}
+
+static int tensor_matvec(GGUFFile *g, const TensorInfo *t,
+                         const float *input, float *output)
+{
+    size_t elems=quant_block_elements(t->type);
+    if (t->n_dims < 2 || !elems || t->dims[0] % elems) return 0;
+    const TensorInfo *tensors[1]={t}; float *outputs[1]={output};
+    return tensor_matvec_hybrid(g,tensors,outputs,1,input);
+}
+
+static int tensor_matvec_batch(GGUFFile *g,const char *const *names,
+                               float *const *outputs,size_t count,
+                               const float *input)
+{
+    if (!count || count>3) return 0;
+    TensorInfo tensors[3]; const TensorInfo *tensor_ptrs[3];
+    for (size_t i=0;i<count;++i) {
+        if (!find_tensor(g,names[i],&tensors[i]) || tensors[i].n_dims<2 ||
+            !quant_block_elements(tensors[i].type) ||
+            tensors[i].dims[0]%quant_block_elements(tensors[i].type) || !outputs[i]) return 0;
+        tensor_ptrs[i]=&tensors[i];
+    }
+    return tensor_matvec_hybrid(g,tensor_ptrs,outputs,count,input);
+}
+
+/* ========================================================= */
+/* F32 vector                                                 */
+/* ========================================================= */
+
+static int load_f32_vector(
+    GGUFFile *g,
+    const TensorInfo *t,
+    float *dst,
+    size_t count)
+{
+    if (t->type != GGML_TYPE_F32)
+        return 0;
+
+    if (t->n_dims < 1)
+        return 0;
+
+    uint64_t elements = 1;
+    for (uint32_t i = 0; i < t->n_dims; ++i) {
+        if (t->dims[i] && elements > UINT64_MAX / t->dims[i])
+            return 0;
+        elements *= t->dims[i];
+    }
+    if (elements != count)
+        return 0;
+
+    uint64_t absolute = (uint64_t)g->data_base + t->offset;
+    if (absolute > g_ram_model.size ||
+        count > (g_ram_model.size - (size_t)absolute) / sizeof(float))
+        return 0;
+    memcpy(dst, g_ram_model.data + (size_t)absolute,
+           count * sizeof(float));
+    return 1;
+}
+
+static int load_embedding_row(GGUFFile *g, const TensorInfo *t,
+                              uint64_t token, float *dst)
+{
+    size_t block_elements=quant_block_elements(t->type);
+    size_t block_bytes=quant_block_bytes(t->type);
+    if (t->n_dims != 2 || token >= t->dims[1] || !block_elements ||
+        !block_bytes || t->dims[0] % block_elements != 0)
+        return 0;
+    uint64_t blocks = t->dims[0] / block_elements;
+    uint8_t block[Q6K_BYTES];
+    float values[QK_K];
+    for (uint64_t b = 0; b < blocks; ++b) {
+        uint64_t off = (uint64_t)g->data_base + t->offset +
+                       (token * blocks + b) * block_bytes;
+        if (off > g_ram_model.size || block_bytes > g_ram_model.size - (size_t)off)
+            return 0;
+        memcpy(block, g_ram_model.data + (size_t)off, block_bytes);
+        dequant_block(t->type, block, values);
+        memcpy(dst + b * block_elements, values, block_elements * sizeof(float));
+    }
+    return 1;
+}
+
+/* ========================================================= */
+/* RMSNorm                                                    */
+/* ========================================================= */
+
+static void rms_norm(
+    const float *input,
+    const float *weight,
+    float *output,
+    size_t n,
+    float eps)
+{
+    double sum_sq = 0.0;
+
+    for (size_t i = 0;
+         i < n;
+         ++i) {
+
+        double x = input[i];
+
+        sum_sq += x * x;
+    }
+
+    float inv_rms =
+        1.0f /
+        sqrtf(
+            (float)(sum_sq / (double)n) +
+            eps);
+
+    for (size_t i = 0;
+         i < n;
+         ++i) {
+
+        output[i] =
+            input[i] *
+            inv_rms *
+            weight[i];
+    }
+}
+
+/* ========================================================= */
+/* RoPE                                                       */
+/* ========================================================= */
+
+static void rope(
+    float *q,
+    float *k,
+    int q_dim,
+    int k_dim,
+    int position)
+{
+    float c[HEAD_DIM / 2], s[HEAD_DIM / 2];
+    for (int pair = 0; pair < HEAD_DIM / 2; ++pair) {
+        float freq = powf(ROPE_BASE, -(2.0f * (float)pair) / (float)HEAD_DIM);
+        float theta = (float)position * freq;
+        c[pair] = cosf(theta); s[pair] = sinf(theta);
+    }
+    for (int base = 0; base < q_dim; base += HEAD_DIM)
+        for (int pair = 0; pair < HEAD_DIM / 2; ++pair) {
+            int i=base+pair, j=i+HEAD_DIM/2; float x0=q[i],x1=q[j];
+            q[i]=x0*c[pair]-x1*s[pair]; q[j]=x0*s[pair]+x1*c[pair];
+        }
+    for (int base = 0; base < k_dim; base += HEAD_DIM)
+        for (int pair = 0; pair < HEAD_DIM / 2; ++pair) {
+            int i=base+pair, j=i+HEAD_DIM/2; float x0=k[i],x1=k[j];
+            k[i]=x0*c[pair]-x1*s[pair]; k[j]=x0*s[pair]+x1*c[pair];
+        }
+}
+
+/* ========================================================= */
+/* Single-head dot product                                    */
+/* ========================================================= */
+
+static float head_dot(
+    const float *q,
+    const float *k,
+    int dim)
+{
+    double sum = 0.0;
+
+    for (int i = 0;
+         i < dim;
+         ++i) {
+
+        sum +=
+            (double)q[i] *
+            (double)k[i];
+    }
+
+    return (float)sum;
+}
+
+/* ========================================================= */
+/* Stable softmax                                             */
+/* ========================================================= */
+
+static void softmax(
+    const float *scores,
+    float *weights,
+    int count)
+{
+    float max_score =
+        scores[0];
+
+    for (int i = 1;
+         i < count;
+         ++i) {
+
+        if (scores[i] > max_score)
+            max_score = scores[i];
+    }
+
+    double sum = 0.0;
+
+    for (int i = 0;
+         i < count;
+         ++i) {
+
+        weights[i] =
+            expf(
+                scores[i] -
+                max_score);
+
+        sum += weights[i];
+    }
+
+    if (sum == 0.0) {
+        for (int i = 0;
+             i < count;
+             ++i)
+            weights[i] = 0.0f;
+
+        return;
+    }
+
+    for (int i = 0;
+         i < count;
+         ++i) {
+
+        weights[i] /=
+            (float)sum;
+    }
+}
+
+/* ========================================================= */
+/* Single-token GQA attention                                 */
+/* ========================================================= */
+
+static int gqa_single_token(
+    const float *q,
+    const float *k,
+    const float *v,
+    float *output,
+    float *key_cache,
+    float *value_cache,
+    size_t layer,
+    size_t position,
+    size_t context_limit,
+    float *scores,
+    float *weights)
+{
+    if (position >= context_limit) return 0;
+    size_t layer_stride = context_limit * KV_DIM;
+    float *layer_k = key_cache + layer * layer_stride;
+    float *layer_v = value_cache + layer * layer_stride;
+    memcpy(layer_k + position * KV_DIM, k, KV_DIM * sizeof(float));
+    memcpy(layer_v + position * KV_DIM, v, KV_DIM * sizeof(float));
+
+    const float scale =
+        1.0f / sqrtf((float)HEAD_DIM);
+    for (int q_head = 0;
+         q_head < Q_HEADS;
+         ++q_head) {
+
+        int kv_head =
+            q_head /
+            (Q_HEADS / KV_HEADS);
+
+        const float *q_head_ptr =
+            q +
+            q_head * HEAD_DIM;
+
+        for (size_t p = 0; p <= position; ++p)
+            scores[p] = head_dot(q_head_ptr,
+                layer_k + p * KV_DIM + kv_head * HEAD_DIM, HEAD_DIM) * scale;
+        softmax(scores, weights, (int)(position + 1));
+        for (int i = 0; i < HEAD_DIM; ++i) {
+            double sum = 0.0;
+            for (size_t p = 0; p <= position; ++p)
+                sum += (double)weights[p] * layer_v[p * KV_DIM + kv_head * HEAD_DIM + i];
+            output[q_head * HEAD_DIM + i] = (float)sum;
+        }
+    }
+    return 1;
+}
+
+/* ========================================================= */
+/* Main                                                       */
+/* ========================================================= */
+
+static int vector_named(GGUFFile *g, const char *name, float *v, size_t n)
+{
+    TensorInfo t;
+    return find_tensor(g, name, &t) && load_f32_vector(g, &t, v, n);
+}
+
+static void add_bias(float *x, const float *bias, size_t n)
+{
+    for (size_t i = 0; i < n; ++i) x[i] += bias[i];
+}
+
+#if 0 /* superseded token-ID prototype */
+static int run_main_utf8(int argc, char **argv)
+{
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s model.gguf token_id\n", argv[0]);
+        return 2;
+    }
+    char *end = NULL;
+    unsigned long long token = strtoull(argv[2], &end, 10);
+    if (!end || *end) {
+        fprintf(stderr, "token_id must be a non-negative integer\n");
+        return 2;
+    }
+    if (!ram_model_load(argv[1])) return 1;
+    GGUFFile g = {0};
+    if (!gguf_open(argv[1], &g)) { ram_model_free(); return 1; }
+
+    enum { FFN_SIZE = 8960, LAYERS = 28 };
+    float *x = calloc(HIDDEN_SIZE, sizeof(float));
+    float *norm = malloc(HIDDEN_SIZE * sizeof(float));
+    float *q = malloc(Q_DIM * sizeof(float));
+    float *k = malloc(KV_DIM * sizeof(float));
+    float *v = malloc(KV_DIM * sizeof(float));
+    float *att = malloc(Q_DIM * sizeof(float));
+    float *proj = malloc(HIDDEN_SIZE * sizeof(float));
+    float *gate = malloc(FFN_SIZE * sizeof(float));
+    float *up = malloc(FFN_SIZE * sizeof(float));
+    float *ffn = malloc(FFN_SIZE * sizeof(float));
+    float *logits = NULL;
+    int ok = 0;
+    if (!x || !norm || !q || !k || !v || !att || !proj || !gate || !up || !ffn) {
+        fprintf(stderr, "Allocation failed\n"); goto done;
+    }
+
+    TensorInfo emb;
+    if (!find_tensor(&g, "token_embd.weight", &emb) || token >= emb.dims[1] ||
+        emb.dims[0] != HIDDEN_SIZE || !load_embedding_row(&g, &emb, token, x)) {
+        fprintf(stderr, "Invalid token ID or unsupported embedding tensor\n"); goto done;
+    }
+
+    for (int layer = 0; layer < LAYERS; ++layer) {
+        char name[96];
+        snprintf(name, sizeof(name), "blk.%d.attn_norm.weight", layer);
+        if (!vector_named(&g, name, norm, HIDDEN_SIZE)) goto tensor_error;
+        rms_norm(x, norm, proj, HIDDEN_SIZE, RMS_EPS);
+
+#define MAT(namefmt, out, rows, cols) do { \
+    snprintf(name, sizeof(name), namefmt, layer); \
+    if (!matvec_named(&g, name, proj, out, rows, cols)) goto tensor_error; \
+} while (0)
+        MAT("blk.%d.attn_q.weight", q, Q_DIM, HIDDEN_SIZE);
+        MAT("blk.%d.attn_k.weight", k, KV_DIM, HIDDEN_SIZE);
+        MAT("blk.%d.attn_v.weight", v, KV_DIM, HIDDEN_SIZE);
+        float *bias = malloc(Q_DIM * sizeof(float));
+        if (!bias) goto tensor_error;
+        snprintf(name, sizeof(name), "blk.%d.attn_q.bias", layer);
+        if (!vector_named(&g, name, bias, Q_DIM)) { free(bias); goto tensor_error; }
+        add_bias(q, bias, Q_DIM);
+        snprintf(name, sizeof(name), "blk.%d.attn_k.bias", layer);
+        if (!vector_named(&g, name, bias, KV_DIM)) { free(bias); goto tensor_error; }
+        add_bias(k, bias, KV_DIM);
+        snprintf(name, sizeof(name), "blk.%d.attn_v.bias", layer);
+        if (!vector_named(&g, name, bias, KV_DIM)) { free(bias); goto tensor_error; }
+        add_bias(v, bias, KV_DIM);
+        free(bias);
+
+        rope(q, k, Q_DIM, KV_DIM, 0);
+        if (!gqa_single_token(q, k, v, att)) goto tensor_error;
+        snprintf(name, sizeof(name), "blk.%d.attn_output.weight", layer);
+        TensorInfo attn_out;
+        if (!find_tensor(&g, name, &attn_out) ||
+            !tensor_matvec(&g, &attn_out, att, proj)) goto tensor_error;
+        for (int i = 0; i < HIDDEN_SIZE; ++i) x[i] += proj[i];
+
+        snprintf(name, sizeof(name), "blk.%d.ffn_norm.weight", layer);
+        if (!vector_named(&g, name, norm, HIDDEN_SIZE)) goto tensor_error;
+        rms_norm(x, norm, proj, HIDDEN_SIZE, RMS_EPS);
+        MAT("blk.%d.ffn_gate.weight", gate, FFN_SIZE, HIDDEN_SIZE);
+        MAT("blk.%d.ffn_up.weight", up, FFN_SIZE, HIDDEN_SIZE);
+        for (int i = 0; i < FFN_SIZE; ++i) {
+            float z = gate[i];
+            ffn[i] = (z / (1.0f + expf(-z))) * up[i];
+        }
+        snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", layer);
+        TensorInfo down;
+        if (!find_tensor(&g, name, &down) || down.n_dims != 2 ||
+            down.dims[0] != FFN_SIZE || down.dims[1] != HIDDEN_SIZE ||
+            !tensor_matvec(&g, &down, ffn, proj)) goto tensor_error;
+        for (int i = 0; i < HIDDEN_SIZE; ++i) x[i] += proj[i];
+        if ((layer + 1) % 4 == 0) fprintf(stderr, "Completed layer %d/%d\n", layer + 1, LAYERS);
+#undef MAT
+    }
+
+    if (!vector_named(&g, "output_norm.weight", norm, HIDDEN_SIZE)) goto tensor_error;
+    rms_norm(x, norm, proj, HIDDEN_SIZE, RMS_EPS);
+    TensorInfo out;
+    if (!find_tensor(&g, "output.weight", &out) || out.n_dims != 2 ||
+        out.dims[0] != HIDDEN_SIZE || out.dims[1] > SIZE_MAX / sizeof(float)) goto tensor_error;
+    logits = malloc((size_t)out.dims[1] * sizeof(float));
+    if (!logits || !tensor_matvec(&g, &out, proj, logits)) goto tensor_error;
+    {
+        uint64_t best[5] = {0};
+        for (int j = 0; j < 5; ++j) best[j] = UINT64_MAX;
+        for (uint64_t i = 0; i < out.dims[1]; ++i) {
+            for (int j = 0; j < 5; ++j) {
+                if (best[j] == UINT64_MAX || logits[i] > logits[best[j]]) {
+                    for (int z = 4; z > j; --z) best[z] = best[z - 1];
+                    best[j] = i; break;
+                }
+            }
+        }
+        printf("Top token scores for input token %llu:\n", token);
+        for (int j = 0; j < 5; ++j)
+            printf("%d: token_id=%llu logit=%g\n", j + 1,
+                   (unsigned long long)best[j], logits[best[j]]);
+    }
+    ok = 1;
+    goto done;
+
+tensor_error:
+    fprintf(stderr, "Inference failed: missing, incompatible, or unreadable tensor\n");
+done:
+    free(x); free(norm); free(q); free(k); free(v); free(att); free(proj);
+    free(gate); free(up); free(ffn); free(logits);
+    gguf_close(&g);
+    ram_model_free();
+    return ok ? 0 : 1;
+}
+#endif
+
+#if defined(ATLAS_COMPACT)
+enum { FFN_SIZE = 4864, LAYERS = 24, MAX_CONTEXT = 2048 };
+#else
+enum { FFN_SIZE = 8960, LAYERS = 28, MAX_CONTEXT = 2048 };
+#endif
+typedef struct {
+    float *x, *norm, *q, *k, *v, *att, *proj, *gate, *up, *ffn, *bias;
+    float *scores, *weights;
+} Work;
+
+#define PREFILL_BATCH 32
+
+typedef struct {
+    GGUFFile *g; const TensorInfo *t; const float *input; float *output;
+    uint64_t blocks, first, last; size_t block_bytes, block_elements;
+    size_t cols, rows, batch;
+    volatile LONG failed;
+} BatchMatvecJob;
+
+/* input:  batch vectors, token-major, each `cols` floats
+   output: batch vectors, token-major, each `rows` floats */
+static void batch_matvec_rows(BatchMatvecJob *job)
+{
+    uint8_t block[Q6K_BYTES];
+    float weights[QK_K];
+    float sums[PREFILL_BATCH];
+    const size_t n = job->batch;
+    for (uint64_t row = job->first; row < job->last; ++row) {
+        for (size_t b = 0; b < n; ++b) sums[b] = 0.0f;
+        for (uint64_t blk = 0; blk < job->blocks; ++blk) {
+            uint64_t absolute = (uint64_t)job->g->data_base + job->t->offset +
+                (row * job->blocks + blk) * job->block_bytes;
+            if (absolute > g_ram_model.size ||
+                job->block_bytes > g_ram_model.size - (size_t)absolute) {
+                InterlockedExchange(&job->failed, 1);
+                break;
+            }
+            memcpy(block, g_ram_model.data + (size_t)absolute, job->block_bytes);
+            dequant_block(job->t->type, block, weights);   /* once per batch */
+            const size_t off = (size_t)blk * job->block_elements;
+            const size_t be = job->block_elements;
+            size_t b = 0;
+            /* four tokens at a time: four independent accumulators */
+            for (; b + 4 <= n; b += 4) {
+                const float *x0 = job->input + (b + 0) * job->cols + off;
+                const float *x1 = job->input + (b + 1) * job->cols + off;
+                const float *x2 = job->input + (b + 2) * job->cols + off;
+                const float *x3 = job->input + (b + 3) * job->cols + off;
+                float s0 = sums[b], s1 = sums[b + 1], s2 = sums[b + 2], s3 = sums[b + 3];
+                for (size_t i = 0; i < be; ++i) {
+                    float wv = weights[i];
+                    s0 += wv * x0[i]; s1 += wv * x1[i];
+                    s2 += wv * x2[i]; s3 += wv * x3[i];
+                }
+                sums[b] = s0; sums[b + 1] = s1; sums[b + 2] = s2; sums[b + 3] = s3;
+            }
+            for (; b < n; ++b) {
+                const float *x = job->input + b * job->cols + off;
+                float s = sums[b];
+                for (size_t i = 0; i < be; ++i) s += weights[i] * x[i];
+                sums[b] = s;
+            }
+        }
+        for (size_t b = 0; b < n; ++b) job->output[b * job->rows + row] = sums[b];
+    }
+}
+
+static VOID CALLBACK batch_matvec_cb(PTP_CALLBACK_INSTANCE inst, PVOID ctx, PTP_WORK work)
+{ (void)inst; (void)work; batch_matvec_rows((BatchMatvecJob *)ctx); }
+
+static int tensor_matvec_cpu_batch(GGUFFile *g, const TensorInfo *t,
+                                   const float *input, float *output, size_t batch)
+{
+    uint64_t cols = t->dims[0], rows = t->dims[1];
+    size_t bytes = quant_block_bytes(t->type), be = quant_block_elements(t->type);
+    if (!bytes || !be || !cols || cols % be || !rows || !batch || batch > PREFILL_BATCH) return 0;
+    SYSTEM_INFO si; GetSystemInfo(&si);
+    DWORD workers = si.dwNumberOfProcessors; if (!workers) workers = 1;
+    if (workers > 16) workers = 16;
+    if (workers > rows) workers = (DWORD)rows;
+    BatchMatvecJob jobs[16];
+    for (DWORD i = 0; i < workers; ++i) {
+        jobs[i] = (BatchMatvecJob){g, t, input, output, cols / be,
+            rows * i / workers, rows * (i + 1) / workers,
+            bytes, be, (size_t)cols, (size_t)rows, batch, 0};
+    }
+    PTP_WORK pool_work[16];
+    for (DWORD pi = 1; pi < workers; ++pi) {
+        pool_work[pi] = CreateThreadpoolWork(batch_matvec_cb, &jobs[pi], NULL);
+        if (pool_work[pi]) SubmitThreadpoolWork(pool_work[pi]);
+        else batch_matvec_rows(&jobs[pi]);
+    }
+    batch_matvec_rows(&jobs[0]);
+    for (DWORD pi = 1; pi < workers; ++pi)
+        if (pool_work[pi]) { WaitForThreadpoolWorkCallbacks(pool_work[pi], FALSE); CloseThreadpoolWork(pool_work[pi]); }
+    for (DWORD i = 0; i < workers; ++i) if (jobs[i].failed) return 0;
+    return 1;
+}
+
+/* look up a tensor by name, check its shape, run the batched matvec */
+static int batch_mv(GGUFFile *g, const char *name, const float *in, float *out,
+                    size_t n, uint64_t cols, uint64_t rows)
+{
+    TensorInfo t;
+    if (!find_tensor(g, name, &t) || t.n_dims != 2 ||
+        t.dims[0] != cols || t.dims[1] != rows) return 0;
+    return tensor_matvec_cpu_batch(g, &t, in, out, n);
+}
+
+typedef struct { float *x, *proj, *q, *k, *v, *att, *gate, *up, *ffn; } PrefillWork;
+
+static void prefill_work_free(PrefillWork *p)
+{
+    free(p->x); free(p->proj); free(p->q); free(p->k); free(p->v);
+    free(p->att); free(p->gate); free(p->up); free(p->ffn);
+    memset(p, 0, sizeof(*p));
+}
+
+static int prefill_work_alloc(PrefillWork *p)
+{
+    const size_t B = PREFILL_BATCH;
+    memset(p, 0, sizeof(*p));
+    p->x    = calloc(B * HIDDEN_SIZE, sizeof(float));
+    p->proj = calloc(B * HIDDEN_SIZE, sizeof(float));
+    p->q    = calloc(B * Q_DIM,       sizeof(float));
+    p->k    = calloc(B * KV_DIM,      sizeof(float));
+    p->v    = calloc(B * KV_DIM,      sizeof(float));
+    p->att  = calloc(B * Q_DIM,       sizeof(float));
+    p->gate = calloc(B * FFN_SIZE,    sizeof(float));
+    p->up   = calloc(B * FFN_SIZE,    sizeof(float));
+    p->ffn  = calloc(B * FFN_SIZE,    sizeof(float));
+    if (!(p->x && p->proj && p->q && p->k && p->v && p->att && p->gate && p->up && p->ffn)) {
+        prefill_work_free(p);
+        return 0;
+    }
+    return 1;
+}
+
+/* Process n prompt tokens (n <= PREFILL_BATCH) at positions pos0..pos0+n-1.
+   CPU path only. Logits are produced only when want_logits is set. */
+static int forward_prefill_batch(GGUFFile *g, const uint32_t *tokens, size_t n,
+                                 size_t pos0, float *kc, float *vc, Work *w,
+                                 PrefillWork *p, float *logits, uint64_t vocab,
+                                 int want_logits)
+{
+    TensorInfo emb;
+    if (!n || n > PREFILL_BATCH || !find_tensor(g, "token_embd.weight", &emb)) return 0;
+    for (size_t t = 0; t < n; ++t) {
+        if (tokens[t] >= emb.dims[1] ||
+            !load_embedding_row(g, &emb, tokens[t], p->x + t * HIDDEN_SIZE)) return 0;
+    }
+    for (int layer = 0; layer < LAYERS; ++layer) {
+        char name[96], q_name[96], k_name[96], v_name[96];
+
+        snprintf(name, sizeof(name), "blk.%d.attn_norm.weight", layer);
+        if (!vector_named(g, name, w->norm, HIDDEN_SIZE)) return 0;
+        for (size_t t = 0; t < n; ++t)
+            rms_norm(p->x + t * HIDDEN_SIZE, w->norm, p->proj + t * HIDDEN_SIZE, HIDDEN_SIZE, RMS_EPS);
+
+        snprintf(q_name, sizeof(q_name), "blk.%d.attn_q.weight", layer);
+        snprintf(k_name, sizeof(k_name), "blk.%d.attn_k.weight", layer);
+        snprintf(v_name, sizeof(v_name), "blk.%d.attn_v.weight", layer);
+        if (!batch_mv(g, q_name, p->proj, p->q, n, HIDDEN_SIZE, Q_DIM)) return 0;
+        if (!batch_mv(g, k_name, p->proj, p->k, n, HIDDEN_SIZE, KV_DIM)) return 0;
+        if (!batch_mv(g, v_name, p->proj, p->v, n, HIDDEN_SIZE, KV_DIM)) return 0;
+
+        snprintf(name, sizeof(name), "blk.%d.attn_q.bias", layer);
+        if (!vector_named(g, name, w->bias, Q_DIM)) return 0;
+        for (size_t t = 0; t < n; ++t) add_bias(p->q + t * Q_DIM, w->bias, Q_DIM);
+        snprintf(name, sizeof(name), "blk.%d.attn_k.bias", layer);
+        if (!vector_named(g, name, w->bias, KV_DIM)) return 0;
+        for (size_t t = 0; t < n; ++t) add_bias(p->k + t * KV_DIM, w->bias, KV_DIM);
+        snprintf(name, sizeof(name), "blk.%d.attn_v.bias", layer);
+        if (!vector_named(g, name, w->bias, KV_DIM)) return 0;
+        for (size_t t = 0; t < n; ++t) add_bias(p->v + t * KV_DIM, w->bias, KV_DIM);
+
+        for (size_t t = 0; t < n; ++t) {
+            rope(p->q + t * Q_DIM, p->k + t * KV_DIM, Q_DIM, KV_DIM, (int)(pos0 + t));
+            if (!gqa_single_token(p->q + t * Q_DIM, p->k + t * KV_DIM, p->v + t * KV_DIM,
+                                  p->att + t * Q_DIM, kc, vc, (size_t)layer, pos0 + t,
+                                  MAX_CONTEXT, w->scores, w->weights)) return 0;
+        }
+
+        snprintf(name, sizeof(name), "blk.%d.attn_output.weight", layer);
+        if (!batch_mv(g, name, p->att, p->proj, n, Q_DIM, HIDDEN_SIZE)) return 0;
+        for (size_t i = 0; i < n * (size_t)HIDDEN_SIZE; ++i) p->x[i] += p->proj[i];
+
+        snprintf(name, sizeof(name), "blk.%d.ffn_norm.weight", layer);
+        if (!vector_named(g, name, w->norm, HIDDEN_SIZE)) return 0;
+        for (size_t t = 0; t < n; ++t)
+            rms_norm(p->x + t * HIDDEN_SIZE, w->norm, p->proj + t * HIDDEN_SIZE, HIDDEN_SIZE, RMS_EPS);
+
+        snprintf(q_name, sizeof(q_name), "blk.%d.ffn_gate.weight", layer);
+        snprintf(k_name, sizeof(k_name), "blk.%d.ffn_up.weight", layer);
+        if (!batch_mv(g, q_name, p->proj, p->gate, n, HIDDEN_SIZE, FFN_SIZE)) return 0;
+        if (!batch_mv(g, k_name, p->proj, p->up,   n, HIDDEN_SIZE, FFN_SIZE)) return 0;
+        for (size_t i = 0; i < n * (size_t)FFN_SIZE; ++i) {
+            float z = p->gate[i];
+            p->ffn[i] = (z / (1.0f + expf(-z))) * p->up[i];
+        }
+
+        snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", layer);
+        if (!batch_mv(g, name, p->ffn, p->proj, n, FFN_SIZE, HIDDEN_SIZE)) return 0;
+        for (size_t i = 0; i < n * (size_t)HIDDEN_SIZE; ++i) p->x[i] += p->proj[i];
+    }
+
+    if (want_logits) {
+        TensorInfo out;
+        if (!vector_named(g, "output_norm.weight", w->norm, HIDDEN_SIZE)) return 0;
+        rms_norm(p->x + (n - 1) * HIDDEN_SIZE, w->norm, w->proj, HIDDEN_SIZE, RMS_EPS);
+        if (!find_tensor(g, "output.weight", &out) || out.dims[1] != vocab ||
+            !tensor_matvec(g, &out, w->proj, logits)) return 0;
+    }
+    return 1;
+}
+
+static int forward_token(GGUFFile *g, uint32_t token, size_t pos,
+                         float *kc, float *vc, Work *w, float *logits,
+                         uint64_t vocab, int want_logits)
+{
+    TensorInfo emb;
+    if (!find_tensor(g, "token_embd.weight", &emb) || token >= emb.dims[1] ||
+        !load_embedding_row(g, &emb, token, w->x)) return 0;
+    for (int layer = 0; layer < LAYERS; ++layer) {
+        char name[96];
+        snprintf(name, sizeof(name), "blk.%d.attn_norm.weight", layer);
+        if (!vector_named(g, name, w->norm, HIDDEN_SIZE)) return 0;
+        rms_norm(w->x, w->norm, w->proj, HIDDEN_SIZE, RMS_EPS);
+        char q_name[96],k_name[96],v_name[96];
+        snprintf(q_name,sizeof(q_name),"blk.%d.attn_q.weight",layer);
+        snprintf(k_name,sizeof(k_name),"blk.%d.attn_k.weight",layer);
+        snprintf(v_name,sizeof(v_name),"blk.%d.attn_v.weight",layer);
+        const char *qkv_names[3]={q_name,k_name,v_name};
+        float *qkv_outputs[3]={w->q,w->k,w->v};
+        if (!tensor_matvec_batch(g,qkv_names,qkv_outputs,3,w->proj)) return 0;
+        snprintf(name, sizeof(name), "blk.%d.attn_q.bias", layer);
+        if (!vector_named(g, name, w->bias, Q_DIM)) return 0;
+        add_bias(w->q, w->bias, Q_DIM);
+        snprintf(name, sizeof(name), "blk.%d.attn_k.bias", layer);
+        if (!vector_named(g, name, w->bias, KV_DIM)) return 0;
+        add_bias(w->k, w->bias, KV_DIM);
+        snprintf(name, sizeof(name), "blk.%d.attn_v.bias", layer);
+        if (!vector_named(g, name, w->bias, KV_DIM)) return 0;
+        add_bias(w->v, w->bias, KV_DIM);
+        rope(w->q, w->k, Q_DIM, KV_DIM, (int)pos);
+        if (!gqa_single_token(w->q, w->k, w->v, w->att, kc, vc,
+                              (size_t)layer, pos, MAX_CONTEXT,
+                              w->scores, w->weights)) return 0;
+        snprintf(name, sizeof(name), "blk.%d.attn_output.weight", layer);
+        TensorInfo ao;
+        if (!find_tensor(g, name, &ao) || !tensor_matvec(g, &ao, w->att, w->proj)) return 0;
+        for (int i = 0; i < HIDDEN_SIZE; ++i) w->x[i] += w->proj[i];
+        snprintf(name, sizeof(name), "blk.%d.ffn_norm.weight", layer);
+        if (!vector_named(g, name, w->norm, HIDDEN_SIZE)) return 0;
+        rms_norm(w->x, w->norm, w->proj, HIDDEN_SIZE, RMS_EPS);
+        char gate_name[96],up_name[96];
+        snprintf(gate_name,sizeof(gate_name),"blk.%d.ffn_gate.weight",layer);
+        snprintf(up_name,sizeof(up_name),"blk.%d.ffn_up.weight",layer);
+        const char *ffn_names[2]={gate_name,up_name};
+        float *ffn_outputs[2]={w->gate,w->up};
+        if (!tensor_matvec_batch(g,ffn_names,ffn_outputs,2,w->proj)) return 0;
+        for (int i = 0; i < FFN_SIZE; ++i) {
+            float z = w->gate[i];
+            w->ffn[i] = (z / (1.0f + expf(-z))) * w->up[i];
+        }
+        snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", layer);
+        TensorInfo down;
+        if (!find_tensor(g, name, &down) || !tensor_matvec(g, &down, w->ffn, w->proj)) return 0;
+        for (int i = 0; i < HIDDEN_SIZE; ++i) w->x[i] += w->proj[i];
+    }
+    if (!vector_named(g, "output_norm.weight", w->norm, HIDDEN_SIZE)) return 0;
+    rms_norm(w->x, w->norm, w->proj, HIDDEN_SIZE, RMS_EPS);
+    if (want_logits) {
+        TensorInfo out;
+        if (!find_tensor(g, "output.weight", &out) || out.dims[1] != vocab ||
+            !tensor_matvec(g, &out, w->proj, logits)) return 0;
+    }
+    return 1;
+}
+
+static double now_ms(void) {
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
+    return 1000.0 * (double)c.QuadPart / (double)f.QuadPart;
+}
+static void *array_alloc(size_t n, size_t size) { return calloc(n, size); }
+
+static uint64_t atlas_random_u64(uint64_t *state)
+{
+    uint64_t x=*state;
+    x^=x>>12; x^=x<<25; x^=x>>27; *state=x;
+    return x*2685821657736338717ULL;
+}
+
+static uint32_t atlas_sample_token(const float *logits,const Tokenizer *tok,
+                                    uint64_t vocab,const uint32_t *history,
+                                    size_t history_count,int allow_stop,
+                                    int greedy,uint64_t *rng,float *confidence)
+{
+    enum { TOP_K=40, RECENT=32 };
+    uint32_t top_ids[TOP_K]={0};
+    float top_values[TOP_K];
+    for(int k=0;k<TOP_K;++k) top_values[k]=-INFINITY;
+    float lse_max=-INFINITY;
+    double lse_sum=0.0;
+    size_t start=history_count>RECENT?history_count-RECENT:0;
+    for(uint64_t i=0;i<vocab;++i) {
+        const char *token=tok->tokens[i];
+        if(!allow_stop && (!strcmp(token,"<|im_end|>") || !strcmp(token,"<|endoftext|>"))) continue;
+        float value=logits[i];
+        for(size_t h=start;!greedy&&h<history_count;++h) if(history[h]==i) {
+            value=value<0.0f?value*1.12f:value/1.12f;
+            break;
+        }
+        float scaled=value/0.35f;
+        if(scaled>lse_max) { lse_sum=lse_sum*exp((double)(lse_max-scaled))+1.0; lse_max=scaled; }
+        else lse_sum+=exp((double)(scaled-lse_max));
+        unsigned lowest=0;
+        for(unsigned k=1;k<TOP_K;++k) if(top_values[k]<top_values[lowest]) lowest=k;
+        if(value>top_values[lowest]) { top_values[lowest]=value; top_ids[lowest]=(uint32_t)i; }
+    }
+    float maximum=-INFINITY;
+    for(unsigned k=0;k<TOP_K;++k) if(top_values[k]>maximum) maximum=top_values[k];
+    if(!isfinite(maximum)) return 0;
+    float weights[TOP_K],total=0.0f;
+    for(unsigned k=0;k<TOP_K;++k) {
+        weights[k]=isfinite(top_values[k])?expf((top_values[k]-maximum)/0.35f):0.0f;
+        total+=weights[k];
+    }
+    unsigned best=0;
+    for(unsigned k=1;k<TOP_K;++k) if(top_values[k]>top_values[best]) best=k;
+    if(confidence) *confidence=total>0.0f && lse_sum>0.0
+        ? (float)(exp((double)(top_values[best]/0.35f-lse_max))/lse_sum):0.0f;
+    if(greedy) return top_ids[best];
+    double pick=((double)(atlas_random_u64(rng)>>11)*(1.0/9007199254740992.0))*total;
+    for(unsigned k=0;k<TOP_K;++k) if((pick-=weights[k])<=0.0) return top_ids[k];
+    return top_ids[best];
+}
+
+static int text_has_term(const char *start,const char *end,const char *term)
+{
+    size_t n=strlen(term);
+    if(!n) return 0;
+    for(const char *p=start;p+n<=end;++p) {
+        size_t i=0;
+        while(i<n && tolower((unsigned char)p[i])==tolower((unsigned char)term[i])) ++i;
+        if(i==n) return 1;
+    }
+    return 0;
+}
+
+static float request_coder_prior(const char *prompt)
+{
+    static const char user_tag[]="<|im_start|>user\n";
+    static const char *signals[]={
+        "code","program","programming","compiler","compile","debug",
+        "implement","source","header","pointer","array","syntax","segfault",
+        "algorithm","makefile","gcc","api","bug","in c","c code","c program",
+        "write a function","implement a function","c function","function in c"
+    };
+    const char *last=prompt,*scan=prompt;
+    while((scan=strstr(scan,user_tag))!=NULL) { last=scan+sizeof(user_tag)-1; scan=last; }
+    const char *end=strstr(last,"<|im_end|>");
+    if(!end) end=last+strlen(last);
+    float score=0.0f;
+    for(size_t i=0;i<sizeof(signals)/sizeof(signals[0]);++i) {
+        if(!text_has_term(last,end,signals[i])) continue;
+        if(i<6) score+=2.0f;
+        else score+=1.0f;
+    }
+    if(score<=0.0f) return 0.20f;
+    float prior=0.50f+0.08f*score;
+    return prior>0.85f?0.85f:prior;
+}
+
+static float request_difficulty_factor(const char *prompt)
+{
+    static const char user_tag[]="<|im_start|>user\n";
+    static const char *signals[]={
+        "prove","proof","derive","step by step","reason through","analyze",
+        "analyse","compare","design","debug","optimize","optimise",
+        "edge case","architecture","trade-off","tradeoff","multiple constraints",
+        "large problem","complex problem","break down","multi-step","multi step",
+        "work through","plan the steps"
+    };
+    const char *last=prompt,*scan=prompt;
+    while((scan=strstr(scan,user_tag))!=NULL) { last=scan+sizeof(user_tag)-1; scan=last; }
+    const char *end=strstr(last,"<|im_end|>");
+    if(!end) end=last+strlen(last);
+    for(size_t i=0;i<sizeof(signals)/sizeof(signals[0]);++i)
+        if(text_has_term(last,end,signals[i])) return 0.20f;
+    return 1.0f;
+}
+
+static int run_main_utf8(int argc, char **argv)
+{
+    if (argc < 3 || argc > 7) {
+        fprintf(stderr, "Usage: %s model.gguf \"prompt text\" [max_new_tokens] [min_new_tokens] [second_model.gguf]\n", argv[0]);
+        return 2;
+    }
+    char *max_end = NULL, *min_end = NULL;
+    unsigned long gen_n = argc >= 4 ? strtoul(argv[3], &max_end, 10) : 32;
+    unsigned long min_n = argc >= 5 ? strtoul(argv[4], &min_end, 10) : 0;
+    if (!gen_n || gen_n > 512 || (argc >= 4 && (!max_end || *max_end)) ||
+        min_n > gen_n || (argc >= 5 && (!min_end || *min_end))) {
+        fprintf(stderr, "max_new_tokens must be between 1 and 512\n"); return 2;
+    }
+    int emit_confidence=argc>1 && !strcmp(argv[argc-1],"--confidence");
+    int paired=argc>=6 && strcmp(argv[5],"--confidence")!=0;
+    float coder_prior=paired?request_coder_prior(argv[2]):1.0f;
+    int use_coder=paired&&coder_prior>=0.50f;
+    int use_language_model=paired&&!use_coder;
+    const char *selected_model=use_language_model?argv[5]:argv[1];
+    double t_start = now_ms(); if(!ram_model_load(selected_model)) return 1;
+    const char *force_cpu=getenv("BRAIN_FORCE_CPU");
+    int gpu_enabled = force_cpu && !strcmp(force_cpu,"1") ? 0 :
+                      brain_gpu_init(g_ram_model.data, g_ram_model.size);
+    g_gpu_enabled=gpu_enabled;
+    const char *hybrid=getenv("BRAIN_HYBRID");
+    g_hybrid_enabled=hybrid && !strcmp(hybrid,"1");
+    fprintf(stderr, "Inference device: %s\n", gpu_enabled ? "Direct3D 12 GPU" : "CPU fallback");
+    GGUFFile g = {0};
+    Tokenizer tok = {0};
+    if (!gguf_open(selected_model, &g) || !load_tokenizer(&g, &tok) || !tokenizer_index(&tok)) {
+        fprintf(stderr, "Could not load tokenizer vocabulary and BPE merges from GGUF\n");
+        tokenizer_free(&tok); gguf_close(&g); brain_gpu_shutdown(); ram_model_free(); return 1;
+    }
+    if(paired)
+        fprintf(stderr,"Atlas assigned model weights: coder %.0f%%, language %.0f%%\n",
+                use_coder?100.0f:0.0f,use_language_model?100.0f:0.0f);
+    else fprintf(stderr,"Atlas using the single-model profile\n");
+    fprintf(stderr, "[time] startup %.0f ms (model load + device init + gguf/tokenizer)\n", now_ms() - t_start); if (!strcmp(argv[2], "--gpu-check")) {
+        const char *names[2]={"blk.0.attn_q.weight","blk.0.attn_v.weight"};
+        int passed=1;
+        for (int which=0; which<2; ++which) {
+            TensorInfo t; float *x=NULL,*cpu=NULL,*gpu_out=NULL;
+            if (!find_tensor(&g,names[which],&t) || t.n_dims!=2) { passed=0; break; }
+            x=malloc((size_t)t.dims[0]*sizeof(float));
+            cpu=malloc((size_t)t.dims[1]*sizeof(float));
+            gpu_out=malloc((size_t)t.dims[1]*sizeof(float));
+            if (!x||!cpu||!gpu_out) { free(x);free(cpu);free(gpu_out);passed=0;break; }
+            for (uint64_t i=0;i<t.dims[0];++i) x[i]=sinf((float)i*0.0137f)*0.25f;
+            int a=brain_gpu_matvec((uint64_t)g.data_base+t.offset,t.type,t.dims[1],t.dims[0],x,gpu_out);
+            int b=tensor_matvec_cpu(&g,&t,x,cpu);
+            double max_error=0.0,max_value=0.0;
+            if (a&&b) for (uint64_t i=0;i<t.dims[1];++i) {
+                double e=fabs((double)gpu_out[i]-cpu[i]);
+                if(e>max_error)max_error=e;
+                if(fabs((double)cpu[i])>max_value)max_value=fabs((double)cpu[i]);
+            }
+            int ok=a&&b&&max_error<=max_value*0.005+0.002;
+            printf("%s GPU/CPU %s, max error %.6g\n",names[which],ok?"PASS":"FAIL",max_error);
+            if(!ok)passed=0;
+            free(x);free(cpu);free(gpu_out);
+        }
+        tokenizer_free(&tok);gguf_close(&g);brain_gpu_shutdown();ram_model_free();
+        return passed?0:1;
+    }
+    size_t max_ids = 8192;
+    uint32_t *ids = malloc(max_ids * sizeof(uint32_t));
+    char *prompt = malloc(strlen(argv[2]) + 128);
+    if (!ids || !prompt) { free(ids); free(prompt); tokenizer_free(&tok);gguf_close(&g);brain_gpu_shutdown();ram_model_free();return 1; }
+    if (!strncmp(argv[2], "<|im_start|>", 12))
+        snprintf(prompt, strlen(argv[2]) + 1, "%s", argv[2]);
+    else
+        snprintf(prompt, strlen(argv[2]) + 128,
+                 "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", argv[2]);
+    size_t prompt_count = tokenize_prompt(&tok, prompt, ids, max_ids);
+    free(prompt);
+    if (!prompt_count) {
+        fprintf(stderr, "Prompt tokenization failed\n");
+        free(ids);tokenizer_free(&tok);gguf_close(&g);brain_gpu_shutdown();ram_model_free();return 1;
+    }
+    if (prompt_count + gen_n >= MAX_CONTEXT) {
+        size_t keep = MAX_CONTEXT - gen_n - 1;
+        memmove(ids, ids + prompt_count - keep, keep * sizeof(uint32_t));
+        prompt_count = keep;
+    }
+    TensorInfo output;
+    if (!find_tensor(&g, "output.weight", &output)) {
+        free(ids);tokenizer_free(&tok);gguf_close(&g);brain_gpu_shutdown();ram_model_free();return 1;
+    }
+    uint64_t vocab = output.dims[1];
+    Work w = {0};
+    w.x=array_alloc(HIDDEN_SIZE,sizeof(float)); w.norm=array_alloc(HIDDEN_SIZE,sizeof(float));
+    w.q=array_alloc(Q_DIM,sizeof(float)); w.k=array_alloc(KV_DIM,sizeof(float));
+    w.v=array_alloc(KV_DIM,sizeof(float)); w.att=array_alloc(Q_DIM,sizeof(float));
+    w.proj=array_alloc(HIDDEN_SIZE,sizeof(float)); w.gate=array_alloc(FFN_SIZE,sizeof(float));
+    w.up=array_alloc(FFN_SIZE,sizeof(float)); w.ffn=array_alloc(FFN_SIZE,sizeof(float));
+    w.bias=array_alloc(Q_DIM,sizeof(float));
+    w.scores=array_alloc(MAX_CONTEXT,sizeof(float));
+    w.weights=array_alloc(MAX_CONTEXT,sizeof(float));
+    float *kc=array_alloc((size_t)LAYERS*MAX_CONTEXT*KV_DIM,sizeof(float));
+    float *vc=array_alloc((size_t)LAYERS*MAX_CONTEXT*KV_DIM,sizeof(float));
+    float *logits=array_alloc((size_t)vocab,sizeof(float));
+    float *active_logits=logits;
+    int ok = w.x&&w.norm&&w.q&&w.k&&w.v&&w.att&&w.proj&&w.gate&&w.up&&w.ffn&&w.bias&&w.scores&&w.weights&&kc&&vc&&logits;
+    if (!ok) fprintf(stderr,"Inference workspace allocation failed\n");
+    double t_prefill = now_ms();
+    const char *no_batch = getenv("BRAIN_NO_BATCH");
+    int use_batch = ok && !g_gpu_enabled && !(no_batch && !strcmp(no_batch,"1"));
+    PrefillWork pw = {0};
+    if (use_batch && !prefill_work_alloc(&pw)) use_batch = 0;
+    if (use_batch) {
+        size_t done = 0;
+        while (ok && done < prompt_count) {
+            size_t n = prompt_count - done; if (n > PREFILL_BATCH) n = PREFILL_BATCH;
+            if (!forward_prefill_batch(&g,ids+done,n,done,kc,vc,&w,&pw,logits,vocab,done+n==prompt_count)) { ok=0; break; }
+            done += n;
+            fprintf(stderr,"Prompt: %zu/%zu tokens\n",done,prompt_count);
+        }
+        prefill_work_free(&pw);
+    } else {
+        for (size_t i=0; ok && i<prompt_count; ++i) {
+            if(!forward_token(&g,ids[i],i,kc,vc,&w,logits,vocab,i+1==prompt_count)) { ok=0; break; }
+            fprintf(stderr,"Prompt: %zu/%zu tokens\n",i+1,prompt_count);
+        }
+    }
+    if (ok) {
+        double prefill_ms = now_ms() - t_prefill; fprintf(stderr, "[time] prefill %.0f ms for %zu tokens (%.1f ms/token)\n", prefill_ms, prompt_count, prefill_ms / (double)prompt_count); double t_gen = now_ms(); LARGE_INTEGER seed_counter; QueryPerformanceCounter(&seed_counter);
+        uint64_t rng=(uint64_t)seed_counter.QuadPart ^ ((uint64_t)GetCurrentProcessId()<<32) ^ GetTickCount64();
+        if(!rng) rng=0x9e3779b97f4a7c15ULL;
+        double confidence_sum=0.0;
+        unsigned confidence_tokens=0;
+        int hit_token_limit=1;
+        for (unsigned step=0; step<gen_n; ++step) {
+            float step_confidence=0.0f;
+            uint32_t next=atlas_sample_token(active_logits,&tok,vocab,
+                ids+prompt_count,step,step>=min_n,min_n==0,&rng,&step_confidence);
+            if (!strcmp(tok.tokens[next],"<|im_end|>") || !strcmp(tok.tokens[next],"<|endoftext|>")) {
+                hit_token_limit=0;
+                break;
+            }
+            confidence_sum+=step_confidence; ++confidence_tokens;
+            ids[prompt_count+step]=next;
+            decode_token(&tok,next,stdout); fflush(stdout);
+            if(step+1<gen_n && !forward_token(&g,next,prompt_count+step,kc,vc,&w,logits,vocab,1)) { ok=0; break; }
+        }
+        fputc('\n',stdout); fflush(stdout);
+        double gen_ms = now_ms() - t_gen; if (confidence_tokens && gen_ms > 0) fprintf(stderr, "[time] generation %.1f tokens/s (%u tokens)\n", confidence_tokens * 1000.0 / gen_ms, confidence_tokens); if(ok && emit_confidence) {
+            float answer_confidence=confidence_tokens
+                ?(float)(confidence_sum/confidence_tokens):0.0f;
+            answer_confidence*=request_difficulty_factor(argv[2]);
+            if(hit_token_limit) answer_confidence*=0.50f;
+            fprintf(stdout,"\036ATLAS_CONFIDENCE=%.4f,TRUNCATED=%d\036\n",
+                    answer_confidence,hit_token_limit);
+        }
+    }
+    if (!ok) fprintf(stderr,"Inference failed: incompatible tensor or model data\n");
+    free(ids); free(w.x); free(w.norm); free(w.q); free(w.k); free(w.v); free(w.att); free(w.proj);
+    free(w.gate); free(w.up); free(w.ffn); free(w.bias); free(w.scores); free(w.weights); free(kc); free(vc); free(logits);
+    tokenizer_free(&tok);gguf_close(&g);brain_gpu_shutdown();ram_model_free();
+    return ok?0:1;
+}
+
+int wmain(int argc, wchar_t **wargv)
+{
+    char **argv = calloc((size_t)argc, sizeof(char *));
+    if (!argv) return 1;
+    for (int i = 0; i < argc; ++i) {
+        int n = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, NULL, 0, NULL, NULL);
+        if (n <= 0 || !(argv[i] = malloc((size_t)n)) ||
+            !WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, argv[i], n, NULL, NULL)) {
+            for (int j = 0; j <= i; ++j) free(argv[j]);
+            free(argv); return 1;
+        }
+    }
+    int result = run_main_utf8(argc, argv);
+    for (int i = 0; i < argc; ++i) free(argv[i]);
+    free(argv);
+    return result;
+}
+#define LAYERS 24
+#define FFN_SIZE 4096
+
+
+
